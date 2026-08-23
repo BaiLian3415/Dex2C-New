@@ -1,0 +1,1116 @@
+#!/usr/bin/env python
+# coding=utf-8
+import argparse
+import os
+import re
+import sys
+import json
+import io
+import zipfile
+
+from os import path
+from logging import getLogger, INFO
+from androguard.core import androconf
+from androguard.core.analysis import analysis
+from androguard.core.androconf import show_logging
+from androguard.core.bytecodes import apk, dvm
+from androguard.util import read
+from dex2c.compiler import Dex2C
+from dex2c.util import (
+    JniLongName,
+    get_method_triple,
+    get_access_method,
+    is_synthetic_method,
+    is_native_method,
+)
+from subprocess import check_call, PIPE, STDOUT, run, CalledProcessError
+from random import choice
+from string import ascii_letters, digits
+from shutil import copy, move, make_archive, rmtree, copytree
+
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+tools_dir = os.path.join(current_dir, "tools")
+
+APKTOOL = os.path.join(tools_dir, "apktool.jar")
+APKTOOL2 = os.path.join(tools_dir, "apktool.bat")
+APKTOOL3 = os.path.join(tools_dir, "apktool")
+SIGNJAR = os.path.join(tools_dir, "apksigner.jar")
+MANIFEST_EDITOR = os.path.join(tools_dir, "manifest-editor.jar")
+NDKBUILD = "ndk-build"
+
+SKIP_SYNTHETIC_METHODS = False
+IGNORE_APP_LIB_ABIS = False
+Logger = getLogger("dcc")
+
+
+def is_windows():
+    return os.name == "nt"
+
+
+def cpu_count():
+    num_processes = os.cpu_count()
+    if num_processes is None:
+        num_processes = 2
+    return num_processes
+
+
+def create_tmp_directory():
+    Logger.info("Creating .tmp folder")
+    if not path.exists(".tmp"):
+        os.mkdir(".tmp")
+
+
+def get_random_str(length=8):
+    characters = ascii_letters + digits
+    result = "".join(choice(characters) for i in range(length))
+    return result
+
+
+def make_temp_dir(prefix="dcc"):
+    random_str = get_random_str()
+    tmp = path.join(".tmp", prefix + random_str)
+    while path.exists(tmp) and path.isdir(tmp):
+        random_str = get_random_str()
+        tmp = path.join(".tmp", prefix + random_str)
+    os.mkdir(tmp)
+    tmp = os.path.normpath(tmp)
+    return tmp
+
+
+def make_temp_file(suffix=""):
+    random_str = get_random_str()
+    tmp = path.join(".tmp", random_str + suffix)
+    while path.exists(tmp) and path.isfile(tmp):
+        random_str = get_random_str()
+        tmp = path.join(".tmp", random_str + suffix)
+    open(tmp, "w")
+    return tmp
+
+
+def modify_application_name(manifest_path, custom_loader):
+    from xml.etree import ElementTree as ET
+    ns = "http://schemas.android.com/apk/res/android"
+    ET.register_namespace("android", ns)
+    with open(manifest_path, "r") as f:
+        file_contents = f.read()
+    manifest_start = file_contents.index("<manifest")
+    before_manifest = file_contents[:manifest_start]
+    root = ET.fromstring(file_contents[manifest_start:])
+    application = root.find("application")
+    if f"{{{ns}}}name" in application.attrib:
+        application.attrib[f"{{{ns}}}name"] = custom_loader
+    else:
+        application.set(f"{{{ns}}}name", custom_loader)
+    if f"{{{ns}}}extractNativeLibs" in application.attrib:
+        application.attrib[f"{{{ns}}}extractNativeLibs"] = "true"
+    xml_str = ET.tostring(root, encoding="utf-8").decode()
+    output = before_manifest + xml_str
+    with open(manifest_path, "w") as f:
+        f.write(output)
+
+
+def clean_tmp_directory():
+    tmpdir = ".tmp"
+    try:
+        Logger.info("Removing .tmp folder")
+        rmtree(tmpdir)
+    except OSError:
+        run(["rd", "/s", "/q", tmpdir], shell=True)
+
+
+# FIX v3: Auto-fix known apktool resource compilation bugs
+def fix_apktool_resource_bugs(decompiled_dir):
+    """Fix known apktool resource compilation issues before rebuilding APK."""
+    import xml.etree.ElementTree as ET
+
+    # Fix 1: xmls.xml files with 'false' values (apktool 2.10.0 bug)
+    # When apktool cannot decode an xml file, it replaces it with FALSE in xmls.xml
+    # aapt2 then fails because it expects a reference, not a boolean
+    xmls_paths = []
+    for root, dirs, files in os.walk(os.path.join(decompiled_dir, "res")):
+        for f in files:
+            if f == "xmls.xml":
+                xmls_paths.append(os.path.join(root, f))
+
+    for xmls_path in xmls_paths:
+        try:
+            tree = ET.parse(xmls_path)
+            root = tree.getroot()
+            modified = False
+
+            for item in root.findall("item"):
+                text = item.text
+                if text and text.strip().lower() == "false":
+                    # Replace false with a dummy reference to prevent aapt error
+                    name_attr = item.get("name", "unknown")
+                    item.text = f"@xml/{name_attr}"
+                    modified = True
+                    Logger.info("Fixed invalid 'false' reference in %s -> %s", xmls_path, item.text)
+
+            if modified:
+                tree.write(xmls_path, encoding="utf-8", xml_declaration=True)
+        except Exception as e:
+            Logger.warning("Could not fix %s: %s", xmls_path, e)
+
+    # Fix 2: Remove empty or corrupted xml directories that cause aapt2 issues
+    for res_dir in ["xml-v18", "xml-v22", "xml-v24", "xml-v26"]:
+        xml_dir = os.path.join(decompiled_dir, "res", res_dir)
+        if os.path.exists(xml_dir):
+            try:
+                files = os.listdir(xml_dir)
+                # If directory only contains placeholder or empty files, remove it
+                if not files or all(f.endswith(".xml") and os.path.getsize(os.path.join(xml_dir, f)) < 50 for f in files):
+                    Logger.info("Removing potentially corrupted resource dir: %s", xml_dir)
+                    rmtree(xml_dir)
+            except Exception as e:
+                Logger.warning("Could not clean %s: %s", xml_dir, e)
+
+
+class ApkTool(object):
+    dcc_cfg = {}
+    with open("dcc.cfg") as fp:
+        dcc_cfg = json.load(fp)
+    APKTOOL = dcc_cfg["apktool"]
+
+    @staticmethod
+    def decompile(apk):
+        outdir = make_temp_dir("dcc-apktool-")
+        if is_windows():
+            check_call([APKTOOL2, "d", "-resm", "keep", "-f", "-o", outdir, apk])
+        else:
+            check_call(["bash", APKTOOL3, "d", "-r", "-f", "-o", outdir, apk])
+        return outdir
+
+    @staticmethod
+    def compile(decompiled_dir):
+        unsiged_apk = make_temp_file("-unsigned.apk")
+
+        # FIX v3: Clean up known resource bugs before compiling
+        fix_apktool_resource_bugs(decompiled_dir)
+
+        if is_windows():
+            # Try aapt2 first
+            cmd = [APKTOOL2, "b", "--use-aapt2", "-o", unsiged_apk, decompiled_dir]
+            try:
+                check_call(cmd, stderr=STDOUT)
+                return unsiged_apk
+            except CalledProcessError as e:
+                Logger.warning("aapt2 build failed: %s", e)
+                Logger.warning("Retrying with legacy aapt...")
+                cmd = [APKTOOL2, "b", "-o", unsiged_apk, decompiled_dir]
+                try:
+                    check_call(cmd, stderr=STDOUT)
+                    return unsiged_apk
+                except CalledProcessError as e2:
+                    Logger.error("Legacy aapt also failed: %s", e2)
+                    raise
+        else:
+            cmd = ["bash", APKTOOL3, "b", "--use-aapt2", "-o", unsiged_apk, decompiled_dir]
+            try:
+                check_call(cmd, stderr=STDOUT)
+                return unsiged_apk
+            except CalledProcessError as e:
+                Logger.warning("aapt2 build failed: %s", e)
+                Logger.warning("Retrying with legacy aapt...")
+                cmd = ["bash", APKTOOL3, "b", "-o", unsiged_apk, decompiled_dir]
+                try:
+                    check_call(cmd, stderr=STDOUT)
+                    return unsiged_apk
+                except CalledProcessError as e2:
+                    Logger.error("Legacy aapt also failed: %s", e2)
+                    raise
+
+
+def change_min_sdk(command=list(), min_sdk="21", update_existing=True):
+    if "--min-sdk-version" in command:
+        if update_existing:
+            min_sdk_value_index = command.index("--min-sdk-version") + 1
+            command[min_sdk_value_index] = min_sdk
+        else:
+            return
+    else:
+        command.append("--min-sdk-version")
+        command.append(min_sdk)
+
+
+def change_max_sdk(command=list(), max_sdk="33", update_existing=True):
+    if "--max-sdk-version" in command:
+        if update_existing:
+            max_sdk_value_index = command.index("--max-sdk-version") + 1
+            command[max_sdk_value_index] = max_sdk
+        else:
+            return
+    else:
+        command.append("--max-sdk-version")
+        command.append(max_sdk)
+
+
+def zipalign(input_apk, output_apk):
+    Logger.info(f"Zipaligning {input_apk} -> {output_apk}")
+    command = ["zipalign"]
+    def _new_zipalign():
+        try:
+            result = run(command, input="", stderr=PIPE, text=True)
+            return "-P <pagesize_kb>" in result.stderr
+        except (CalledProcessError, FileNotFoundError):
+            return False
+    if _new_zipalign():
+        Logger.info("Using latest zipalign (-P 16)")
+        command.extend(["-P", "16", "-f", "4"])
+    else:
+        Logger.info("Using legacy zipalign (-p)")
+        command.extend(["-p", "-f", "4"])
+    command.extend([input_apk, output_apk])
+    try:
+        check_call(command, stderr=STDOUT)
+    except Exception as ex:
+        Logger.error("Zipaligning %s failed!" % input_apk, exc_info=True)
+        print(f"{str(ex)}")
+
+
+def sign(unsigned_apk, signed_apk):
+    signature = {}
+    keystore = ""
+    Logger.info(f"Signing {unsigned_apk} -> {signed_apk}")
+    with open("dcc.cfg") as fp:
+        dcc_cfg = json.load(fp)
+        signature = dcc_cfg["signature"]
+        keystore = signature["keystore_path"]
+    if (
+        signature["v1_enabled"] is False
+        and signature["v2_enabled"] is False
+        and signature["v3_enabled"] is False
+    ):
+        Logger.warning("At least one signing scheme should be enabled from v1, v2 & v3")
+        move_unsigned(unsigned_apk, signed_apk)
+        return
+    if not path.exists(keystore) or not path.isfile(keystore):
+        Logger.error("KeyStore not found in defined path or not recognized as a file")
+        move_unsigned(unsigned_apk, signed_apk)
+        return
+    command = [
+        "java",
+        "-jar",
+        SIGNJAR,
+        "sign",
+        "--in",
+        unsigned_apk,
+        "--out",
+        signed_apk,
+        "--ks",
+        keystore,
+        "--ks-key-alias",
+        signature["alias"],
+        "--ks-pass",
+        "pass:" + signature["keystore_pass"],
+        "--key-pass",
+        "pass:" + signature["store_pass"],
+    ]
+    command.append("--v1-signing-enabled")
+    command.append("true" if signature["v1_enabled"] is True else "false")
+    command.append("--v2-signing-enabled")
+    command.append("true" if signature["v2_enabled"] is True else "false")
+    command.append("--v3-signing-enabled")
+    command.append("true" if signature["v3_enabled"] is True else "false")
+    command.append("--v4-signing-enabled")
+    command.append("false")
+    if signature["v1_enabled"] is True:
+        change_min_sdk(command, "21")
+        change_max_sdk(command, "23")
+        command.append("--v1-signer-name")
+        command.append("ANDROID")
+    if signature["v2_enabled"] is True:
+        change_min_sdk(command, "24", False)
+        change_max_sdk(command, "26")
+    if signature["v3_enabled"] is True:
+        change_min_sdk(command, "28", False)
+        change_max_sdk(command, "29")
+    try:
+        check_call(command, stderr=STDOUT)
+    except Exception as ex:
+        Logger.error("Signing %s failed!" % unsigned_apk, exc_info=True)
+        print(f"{str(ex)}")
+        move_unsigned(unsigned_apk, signed_apk)
+
+
+def move_unsigned(unsigned_apk, signed_apk):
+    Logger.info("Moving unsigned apk -> " + signed_apk)
+    copy(unsigned_apk, signed_apk)
+
+
+def build_project(project_dir):
+    _cmd = [NDKBUILD, "-C", project_dir]
+    try:
+        cmd = _cmd + ["-j%d" % cpu_count()]
+        check_call(cmd, stderr=STDOUT)
+    except CalledProcessError:
+        Logger.warning("Parallel build failed, retrying serial build...")
+        check_call(_cmd, stderr=STDOUT)
+
+
+def auto_vm(filename):
+    ret = androconf.is_android(filename)
+    dex_files = list()
+    if ret == "APK":
+        apk_obj = apk.APK(filename)
+        all_dex = apk_obj.get_all_dex()
+        if not all_dex:
+            all_dex = [apk_obj.get_dex()]
+        for dex in all_dex:
+            if dex:
+                dex_files.append(dvm.DalvikVMFormat(dex))
+    elif ret == "DEX" or ret == "DEY":
+        dex_files.append(dvm.DalvikVMFormat(read(filename)))
+    else:
+        raise Exception("Unsupported file %s" % filename)
+    return dex_files
+
+
+class MethodFilter(object):
+    def __init__(self, rules, vm):
+        self._compile_filters = []
+        self._keep_filters = []
+        self._compile_full_match = set()
+        self.conflict_methods = set()
+        self.native_methods = set()
+        self.annotated_methods = set()
+        self._load_filter_rules(rules)
+        self._init_conflict_methods(vm)
+        self._init_native_methods(vm)
+        self._init_annotation_methods(vm)
+
+    def _load_filter_rules(self, rules):
+        for line in rules:
+            line = line.strip()
+            if line[0] == "!":
+                line = line[1:].strip()
+                self._keep_filters.append(re.compile(line))
+            elif line[0] == "=":
+                line = line[1:].strip()
+                self._compile_full_match.add(line)
+            else:
+                self._compile_filters.append(re.compile(line))
+
+    def _init_conflict_methods(self, vm):
+        all_methods = {}
+        for m in vm.get_methods():
+            method_triple = get_method_triple(m, return_type=False)
+            if method_triple in all_methods:
+                self.conflict_methods.add(m)
+                self.conflict_methods.add(all_methods[method_triple])
+            else:
+                all_methods[method_triple] = m
+
+    def _init_native_methods(self, vm):
+        for m in vm.get_methods():
+            cls_name, name, _ = get_method_triple(m)
+            access = get_access_method(m.get_access_flags())
+            if "native" in access:
+                self.native_methods.add((cls_name, name))
+
+    def _add_annotation_method(self, method):
+        if not is_synthetic_method(method) and not is_native_method(method):
+            self.annotated_methods.add(method)
+
+    def _init_annotation_methods(self, vm):
+        for c in vm.get_classes():
+            adi_off = c.get_annotations_off()
+            if adi_off == 0:
+                continue
+            adi = vm.CM.get_obj_by_offset(adi_off)
+            annotated_class = False
+            if adi.get_class_annotations_off() != 0:
+                ann_set_item = vm.CM.get_obj_by_offset(adi.get_class_annotations_off())
+                for aoffitem in ann_set_item.get_annotation_off_item():
+                    annotation_item = vm.CM.get_obj_by_offset(
+                        aoffitem.get_annotation_off()
+                    )
+                    encoded_annotation = annotation_item.get_annotation()
+                    type_desc = vm.CM.get_type(encoded_annotation.get_type_idx())
+                    if type_desc.endswith("Dex2C;"):
+                        annotated_class = True
+                        for method in c.get_methods():
+                            self._add_annotation_method(method)
+                        break
+            if not annotated_class:
+                for mi in adi.get_method_annotations():
+                    method = vm.get_method_by_idx(mi.get_method_idx())
+                    ann_set_item = vm.CM.get_obj_by_offset(mi.get_annotations_off())
+                    for aoffitem in ann_set_item.get_annotation_off_item():
+                        annotation_item = vm.CM.get_obj_by_offset(
+                            aoffitem.get_annotation_off()
+                        )
+                        encoded_annotation = annotation_item.get_annotation()
+                        type_desc = vm.CM.get_type(encoded_annotation.get_type_idx())
+                        if type_desc.endswith("Dex2C;"):
+                            self._add_annotation_method(method)
+
+    def should_compile(self, method):
+        if method in self.conflict_methods:
+            return False
+        if is_synthetic_method(method) and SKIP_SYNTHETIC_METHODS:
+            return False
+        if is_native_method(method):
+            return False
+        method_triple = get_method_triple(method)
+        cls_name, name, _ = method_triple
+        if name == "<clinit>":
+            return False
+        if (cls_name, name) in self.native_methods:
+            return False
+        full_name = "".join(method_triple)
+        for rule in self._keep_filters:
+            if rule.search(full_name):
+                return False
+        if full_name in self._compile_full_match:
+            return True
+        if method in self.annotated_methods:
+            return True
+        for rule in self._compile_filters:
+            if rule.search(full_name):
+                return True
+        return False
+
+
+def copy_compiled_libs(project_dir, decompiled_dir):
+    compiled_libs_dir = path.join(project_dir, "libs")
+    decompiled_libs_dir = path.join(decompiled_dir, "lib")
+    if not path.exists(compiled_libs_dir):
+        return
+    if not path.exists(decompiled_libs_dir):
+        copytree(compiled_libs_dir, decompiled_libs_dir)
+        return
+    for abi in os.listdir(decompiled_libs_dir):
+        dst = path.join(decompiled_libs_dir, abi)
+        src = path.join(compiled_libs_dir, abi)
+        if not path.exists(src) and abi == "armeabi":
+            src = path.join(compiled_libs_dir, "armeabi-v7a")
+            Logger.warning("Use armeabi-v7a for armeabi")
+        if not path.exists(src):
+            if IGNORE_APP_LIB_ABIS:
+                continue
+            else:
+                raise Exception("ABI %s is not supported!" % abi)
+        android_mk_filename = "project/jni/Android.mk"
+        local_module_value = ""
+        with open(android_mk_filename, "r") as android_mk_file:
+            for line in android_mk_file:
+                if line.startswith("LOCAL_MODULE"):
+                    _, local_module_value = line.split(":=", 1)
+                    local_module_value = local_module_value.strip()
+                    break
+        libnc = path.join(src, "lib" + local_module_value + ".so")
+        copy(libnc, dst)
+
+
+def native_class_methods(smali_path, compiled_methods):
+    def next_line():
+        return fp.readline()
+    def handle_annotanion():
+        while True:
+            line = next_line()
+            if not line:
+                break
+            s = line.strip()
+            code_lines.append(line)
+            if s == ".end annotation":
+                break
+            else:
+                continue
+    def handle_method_body():
+        while True:
+            line = next_line()
+            if not line:
+                break
+            s = line.strip()
+            if s == ".end method":
+                break
+            elif s.startswith(".annotation runtime") and s.find("Dex2C") < 0:
+                code_lines.append(line)
+                handle_annotanion()
+            else:
+                continue
+    code_lines = []
+    class_name = ""
+    with open(smali_path, "r") as fp:
+        while True:
+            line = next_line()
+            if not line:
+                break
+            code_lines.append(line)
+            line = line.strip()
+            if line.startswith(".class"):
+                class_name = line.split(" ")[-1]
+            elif line.startswith(".method"):
+                current_method = line.split(" ")[-1]
+                param = current_method.find("(")
+                name, proto = current_method[:param], current_method[param:]
+                if (class_name, name, proto) in compiled_methods:
+                    if line.find(" native ") < 0:
+                        code_lines[-1] = code_lines[-1].replace(
+                            current_method, "native " + current_method
+                        )
+                    handle_method_body()
+                    code_lines.append(".end method\n")
+    with open(smali_path, "w") as fp:
+        fp.writelines(code_lines)
+
+
+def native_compiled_dexes(decompiled_dir, compiled_methods):
+    classes_output = list(
+        filter(lambda x: x.find("smali") >= 0, os.listdir(decompiled_dir))
+    )
+    todo = []
+    for classes in classes_output:
+        for method_triple in compiled_methods.keys():
+            cls_name, name, proto = method_triple
+            cls_name = cls_name[1:-1]
+            smali_path = path.join(decompiled_dir, classes, cls_name) + ".smali"
+            if path.exists(smali_path):
+                todo.append(smali_path)
+    for smali_path in todo:
+        native_class_methods(smali_path, compiled_methods)
+
+
+def write_compiled_methods(project_dir, compiled_methods):
+    source_dir = path.join(project_dir, "jni", "nc")
+    if not path.exists(source_dir):
+        os.makedirs(source_dir)
+    for method_triple, code in compiled_methods.items():
+        full_name = JniLongName(*method_triple)
+        filepath = path.join(source_dir, full_name) + ".cpp"
+        if path.exists(filepath):
+            Logger.warning("Overwrite file %s %s" % (filepath, method_triple))
+        try:
+            with open(filepath, "w", encoding="utf-8") as fp:
+                fp.write('#include "Dex2C.h"\n' + code)
+        except Exception as e:
+            print(f"{str(e)}\n")
+    with open(
+        path.join(source_dir, "compiled_methods.txt"), "w", encoding="utf-8"
+    ) as fp:
+        fp.write("\n".join(list(map("".join, compiled_methods.keys()))))
+
+
+def archive_compiled_code(project_dir):
+    outfile = make_temp_file("-dcc")
+    outfile = make_archive(outfile, "zip", project_dir)
+    return outfile
+
+
+def compile_dex(apkfile, filtercfg, obfus, dynamic_register, allow_global):
+    parsed_rules = []
+    with open(filtercfg, "r", encoding="utf-8") as fp:
+        for line in fp:
+            rule = line.strip()
+            if not rule or rule.startswith("#"):
+                continue
+            if rule == ".*" and not allow_global:
+                Logger.error(
+                    "Global catch-all rule (.*) detected\n" +
+                    "A global wildcard will likely break your build.\n" +
+                    "Suggested Fix: Targeted conversion is safer. Example:\n" +
+                    "  - com/some/package/.*;.*\n" +
+                    "If you really need to process everything, use --allow-global\n"
+                )
+                return {}, {}, []
+            parsed_rules.append(rule)
+    dex_files = auto_vm(apkfile)
+    dex_analysis = analysis.Analysis()
+    X_native_method_prototype = {}
+    X_compiled_method_code = {}
+    X_errors = []
+    for dex in dex_files:
+        dex_analysis.add(dex)
+    for dex in dex_files:
+        method_filter = MethodFilter(parsed_rules, dex)
+        compiler = Dex2C(dex, dex_analysis, obfus, dynamic_register)
+        native_method_prototype = {}
+        compiled_method_code = {}
+        errors = []
+        for m in dex.get_methods():
+            method_triple = get_method_triple(m)
+            jni_longname = JniLongName(*method_triple)
+            full_name = "".join(method_triple)
+            if len(jni_longname) > 220:
+                Logger.debug("Name to long %s(> 220) %s" % (jni_longname, full_name))
+                continue
+            if method_filter.should_compile(m):
+                Logger.debug("compiling %s" % (full_name))
+                try:
+                    code = compiler.get_source_method(m)
+                except Exception as e:
+                    Logger.warning(
+                        "compile method failed:%s (%s)" % (full_name, str(e)),
+                        exc_info=True,
+                    )
+                    errors.append("%s:%s" % (full_name, str(e)))
+                    X_errors.extend(errors)
+                    continue
+                if code[0]:
+                    compiled_method_code[method_triple] = code[0]
+                    native_method_prototype[jni_longname] = code[1]
+                    X_native_method_prototype.update(native_method_prototype)
+                    X_compiled_method_code.update(compiled_method_code)
+    return X_compiled_method_code, X_native_method_prototype, X_errors
+
+
+def is_apk(name):
+    return name.endswith(".apk")
+
+
+def get_application_name_from_manifest(apk_file):
+    a = apk.APK(apk_file)
+    manifest_data = a.get_android_manifest_xml()
+    application_element = manifest_data.find("application")
+    application_name = application_element.get(
+        "{http://schemas.android.com/apk/res/android}name", ""
+    )
+    if application_name.startswith("."):
+        application_name = a.package + application_name
+    return application_name
+
+
+def get_smali_folders(decompiled_dir):
+    folders = os.listdir(decompiled_dir)
+    folders = [
+        folder
+        for folder in folders
+        if path.isdir(path.join(decompiled_dir, folder)) and folder.startswith("smali")
+    ]
+    return folders
+
+
+def get_application_class_file(decompiled_dir, smali_folders, application_name):
+    if not application_name == "":
+        fileName = application_name.replace(".", os.sep) + ".smali"
+        for smali_folder in smali_folders:
+            filePath = path.join(decompiled_dir, smali_folder, fileName)
+            if path.exists(filePath):
+                return filePath
+    return ""
+
+
+def adjust_application_mk(apkfile, project_dir):
+    Logger.info("Adjusting Application.mk file using available abis from apk")
+    supported_abis = {"armeabi-v7a", "arm64-v8a", "x86_64", "x86"}
+    depreacated_abis = {"armeabi"}
+    available_abis = set()
+    if is_apk(apkfile):
+        zip_file = zipfile.ZipFile(io.BytesIO(bytearray(read(apkfile))), mode="r")
+        for file_name in zip_file.namelist():
+            if file_name.startswith("lib/"):
+                abi_name = file_name.split("/")[1].strip()
+                if len(file_name.split("/")) <= 2:
+                    continue
+                if abi_name in supported_abis:
+                    available_abis.add(abi_name)
+                elif abi_name in depreacated_abis:
+                    Logger.warning("ABI 'armeabi' is depreacated, using 'armeabi-v7a' instead")
+                    available_abis.add("armeabi-v7a")
+                else:
+                    raise Exception(
+                        f"ABI '{abi_name}' is unsupported, please remove it from apk or use flag --force-keep-libs and try again"
+                    )
+        if len(available_abis) == 0:
+            Logger.info("No lib abis found in apk, using the ones defined in Application.mk file")
+            return
+        application_mk_path = path.join(project_dir, "jni", "Application.mk")
+        temp_application_mk_path = make_temp_file("-application.mk")
+        with open(application_mk_path, "r") as application_mk_file:
+            with open(temp_application_mk_path, "w") as temp_application_mk_file:
+                for line in application_mk_file:
+                    if line.startswith("APP_ABI"):
+                        line = "APP_ABI := " + " ".join(available_abis) + "\n"
+                    temp_application_mk_file.write(line)
+        os.remove(application_mk_path)
+        copy(temp_application_mk_path, application_mk_path)
+    else:
+        raise Exception(f"{apkfile} is not an apk file")
+
+
+def write_dummy_dynamic_register(project_dir):
+    source_dir = os.path.join(project_dir, "jni", "nc")
+    if not os.path.exists(source_dir):
+        os.makedirs(source_dir)
+    filepath = os.path.join(source_dir, "DynamicRegister.cpp")
+    with open(filepath, "w", encoding="utf-8") as fp:
+        fp.write(
+            '#include "DynamicRegister.h"\n\nconst char *dynamic_register_compile_methods(JNIEnv *env) { return nullptr; }'
+        )
+
+
+def write_dynamic_register(project_dir, compiled_methods, method_prototypes):
+    source_dir = os.path.join(project_dir, "jni", "nc")
+    if not os.path.exists(source_dir):
+        os.makedirs(source_dir)
+    export_list = {}
+    for method_triple in sorted(compiled_methods.keys()):
+        full_name = JniLongName(*method_triple)
+        if full_name not in method_prototypes:
+            raise Exception("Method %s prototype info could not be found" % full_name)
+        class_path = method_triple[0][1:-1].replace(".", "/")
+        method_name = method_triple[1]
+        method_signature = method_triple[2]
+        method_native_name = full_name
+        method_native_prototype = method_prototypes[full_name]
+        if class_path not in export_list:
+            export_list[class_path] = []
+        export_list[class_path].append(
+            (method_name, method_signature, method_native_name, method_native_prototype)
+        )
+    if len(export_list) == 0:
+        Logger.info("No export methods")
+        return
+    extern_block = []
+    export_block = ["\njclass clazz;\n"]
+    export_block_template = 'clazz = env->FindClass("%s");\nif (clazz == nullptr)\n    return "Class not found: %s";\n'
+    export_block_template += "const JNINativeMethod export_method_%d[] = {\n%s\n};\n"
+    export_block_template += "env->RegisterNatives(clazz, export_method_%d, %d);\n"
+    export_block_template += "env->DeleteLocalRef(clazz);\n"
+    for index, class_path in enumerate(sorted(export_list.keys())):
+        methods = export_list[class_path]
+        extern_block.append("\n".join(["extern %s;" % method[3] for method in methods]))
+        export_methods = ",\n".join(
+            [
+                '{"%s", "%s", (void *)%s}' % (method[0], method[1], method[2])
+                for method in methods
+            ]
+        )
+        export_block.append(
+            export_block_template
+            % (class_path, class_path, index, export_methods, index, len(methods))
+        )
+    export_block.append("return nullptr;\n")
+    filepath = os.path.join(source_dir, "DynamicRegister.cpp")
+    with open(filepath, "w", encoding="utf-8") as fp:
+        fp.write('#include "DynamicRegister.h"\n\n')
+        fp.write("\n".join(extern_block))
+        fp.write("\n\nconst char *dynamic_register_compile_methods(JNIEnv *env) {")
+        fp.write("\n".join(export_block))
+        fp.write("}")
+
+
+def dcc_main(
+    apkfile,
+    obfus,
+    filtercfg,
+    custom_loader,
+    outapk,
+    project_dir,
+    do_compile=True,
+    source_archive="project-source.zip",
+    dynamic_register=False,
+    disable_signing=False,
+    allow_global=False,
+    enable_ollvm=False,
+    ollvm_flags="",
+):
+    if not path.exists(apkfile):
+        Logger.error("Input apk file %s does not exist", apkfile)
+        return
+    if custom_loader.rfind(".") == -1:
+        Logger.error(
+            "\n[ERROR] Custom Loader must have at least one package, such as Demo.%s\n",
+            custom_loader,
+        )
+        return
+    if enable_ollvm:
+        Logger.warning("You've enabled ollvm flag, make sure your NDK supports it!")
+        ollvm_cppflags = f"LOCAL_CPPFLAGS := {ollvm_flags}\n"
+        android_mk_path = path.join(project_dir, "jni", "Android.mk")
+        with open(android_mk_path, "r+") as file:
+            lines = file.readlines()
+            for index, line in enumerate(lines):
+                if "LOCAL_LDLIBS    := -llog" in line:
+                    lines.insert(index + 1, ollvm_cppflags)
+                    break
+            file.seek(0)
+            file.writelines(lines)
+
+    dex2c_cpp_path = path.join(project_dir, "jni", "nc", "Dex2C.cpp")
+    with open(dex2c_cpp_path, "r") as file:
+        dex2c_file_data = file.read()
+    dex2c_file_data = dex2c_file_data.replace(
+        'env->FindClass("amimo/dcc/DccApplication");',
+        'env->FindClass("' + custom_loader.replace(".", "/") + '");',
+    )
+    dex2c_file_data = dex2c_file_data.replace(
+        "Java_amimo_dcc_DccApplication", "Java_" + custom_loader.replace(".", "_")
+    )
+    with open(dex2c_cpp_path, "w") as file:
+        file.write(dex2c_file_data)
+
+    if not IGNORE_APP_LIB_ABIS:
+        adjust_application_mk(apkfile, project_dir)
+
+    compiled_methods, method_prototypes, errors = compile_dex(
+        apkfile, filtercfg, obfus, dynamic_register, allow_global
+    )
+    if errors:
+        Logger.warning("================================")
+        Logger.warning("\n".join(errors))
+        Logger.warning("================================")
+    if len(compiled_methods) == 0:
+        Logger.info("No methods compiled! Check your filter file.")
+        return
+    write_compiled_methods(project_dir, compiled_methods)
+    if not do_compile:
+        src_zip = archive_compiled_code(project_dir)
+        move(src_zip, source_archive)
+    if do_compile:
+        if dynamic_register:
+            write_dynamic_register(project_dir, compiled_methods, method_prototypes)
+        else:
+            write_dummy_dynamic_register(project_dir)
+        build_project(project_dir)
+
+    if is_apk(apkfile) and outapk:
+        decompiled_dir = ApkTool.decompile(apkfile)
+
+        # Verify decompiled_dir is valid before proceeding
+        if not path.exists(decompiled_dir) or not path.isdir(decompiled_dir):
+            Logger.error("Apktool decompilation failed: output directory does not exist")
+            return
+        manifest_path = path.join(decompiled_dir, "AndroidManifest.xml")
+        if not path.exists(manifest_path):
+            Logger.error("Apktool decompilation failed: AndroidManifest.xml not found")
+            return
+
+        native_compiled_dexes(decompiled_dir, compiled_methods)
+        copy_compiled_libs(project_dir, decompiled_dir)
+        smali_folders = get_smali_folders(decompiled_dir)
+
+        # Protect against empty smali_folders (IndexError)
+        if not smali_folders:
+            Logger.error("No smali folders found in decompiled directory. Apktool may have failed.")
+            return
+
+        android_mk_file_path = path.join(project_dir, "jni", "Android.mk")
+        loader_file_path = "loader/DccApplication.smali"
+        temp_loader = make_temp_file("-Loader.smali")
+        local_module_value = None
+        with open(android_mk_file_path, "r") as android_mk_file:
+            for line in android_mk_file:
+                if line.startswith("LOCAL_MODULE"):
+                    _, local_module_value = line.split(":=", 1)
+                    local_module_value = local_module_value.strip()
+                    break
+        if local_module_value:
+            pattern = r'const-string v0, "[\w\W]+"'
+            replacement = 'const-string v0, "' + local_module_value + '"'
+        else:
+            raise Exception("Invalid LOCAL_MODULE defined in project/jni/Android.mk")
+        with open(loader_file_path, "r") as file:
+            filedata = file.read()
+        filedata = re.sub(pattern, replacement, filedata)
+        filedata = filedata.replace(
+            "Lamimo/dcc/DccApplication;", "L" + custom_loader.replace(".", "/") + ";"
+        )
+        with open(temp_loader, "w") as file:
+            file.write(filedata)
+        apk_file_path = apkfile
+        application_class_name = get_application_name_from_manifest(apk_file_path)
+        file_path = get_application_class_file(
+            decompiled_dir, smali_folders, application_class_name
+        )
+        if application_class_name == "" or file_path == "":
+            for smali_folder in smali_folders:
+                loader = path.join(
+                    decompiled_dir,
+                    smali_folder,
+                    custom_loader.replace(".", os.sep) + ".smali",
+                )
+                if path.isfile(loader):
+                    Logger.error(
+                        f" Please, edit the Custom Loader: {custom_loader} already exists.\n"
+                    )
+                    return
+            try:
+                Logger.info(
+                    "\nApplication class not found in the AndroidManifest.xml or doesn't exist in dex, adding "
+                    + custom_loader + "\n"
+                )
+                if is_windows():
+                    modify_application_name(
+                        path.join(decompiled_dir, "AndroidManifest.xml"), custom_loader
+                    )
+                else:
+                    check_call(
+                        [
+                            "java",
+                            "-jar",
+                            MANIFEST_EDITOR,
+                            path.join(decompiled_dir, "AndroidManifest.xml"),
+                            custom_loader,
+                        ],
+                        stderr=STDOUT,
+                    )
+            except CalledProcessError as e:
+                Logger.error(f"Error: {e.returncode} - {e.output}", exc_info=True)
+            except Exception as e:
+                Logger.error(f"Error: {e}", exc_info=True)
+        else:
+            Logger.info(
+                "\nApplication class from AndroidManifest.xml, "
+                + application_class_name + "\n"
+            )
+            if is_windows():
+                modify_application_name(
+                    path.join(decompiled_dir, "AndroidManifest.xml"),
+                    application_class_name,
+                )
+            else:
+                check_call(
+                    [
+                        "java",
+                        "-jar",
+                        MANIFEST_EDITOR,
+                        path.join(decompiled_dir, "AndroidManifest.xml"),
+                        application_class_name,
+                    ],
+                    stderr=STDOUT,
+                )
+            line_to_insert = (
+                "    invoke-static {}, L"
+                + custom_loader.replace(".", "/")
+                + ";->initDcc()V\n"
+            )
+            code_block_to_append = f"""
+                .method static final constructor <clinit>()V
+                    .registers 0
+                {line_to_insert}
+                    return-void
+                .end method
+                """
+            with open(file_path, "r") as file:
+                content = file.readlines()
+            index = next(
+                (i for i, line in enumerate(content) if "<clinit>" in line), None
+            )
+            if index is not None:
+                locals_index = next(
+                    (
+                        i
+                        for i, line in enumerate(content[index:])
+                        if ".locals" in line or ".registers" in line
+                    ),
+                    None,
+                )
+                if locals_index is not None:
+                    loc = re.compile(
+                        "(    (?:\\.locals|\\.registers) )(\\d+)\\n"
+                    ).search(content[index + locals_index])
+                    if loc.group(2) == "0":
+                        content[index + locals_index] = loc.group(1) + "1" + "\n"
+                    content.insert(index + locals_index + 1, line_to_insert)
+                else:
+                    Logger.error("Couldn't read <clinit> method in Application class")
+            else:
+                content.append(code_block_to_append)
+            with open(file_path, "w") as file:
+                file.writelines(content)
+        if custom_loader.rfind(".") > -1:
+            loaderDir = path.join(
+                decompiled_dir,
+                smali_folders[-1],
+                custom_loader[0 : custom_loader.rfind(".")].replace(".", os.sep),
+            )
+            if not path.isdir(loaderDir):
+                os.makedirs(loaderDir)
+        copy(
+            temp_loader,
+            path.join(
+                decompiled_dir,
+                smali_folders[-1],
+                custom_loader.replace(".", os.sep) + ".smali",
+            ),
+        )
+
+        unsigned_apk = ApkTool.compile(decompiled_dir)
+
+        # Verify unsigned_apk was actually created
+        if not path.exists(unsigned_apk):
+            Logger.error("Apktool compilation failed: unsigned APK was not generated")
+            return
+
+        zipalign(unsigned_apk, outapk)
+        if not disable_signing:
+            sign(outapk, outapk)
+
+
+sys.setrecursionlimit(5000)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-a", "--input", help="Input apk file path", required=True)
+    parser.add_argument("-o", "--out", help="Output apk file path", required=True)
+    parser.add_argument("-p", "--obfuscate", action="store_true", default=False, help="Obfuscate string constants.")
+    parser.add_argument("-d", "--dynamic-register", action="store_true", default=False, help="Export native methods using RegisterNatives.")
+    parser.add_argument("--filter", default="filter.txt", help="Method filters configuration file.")
+    parser.add_argument("--custom-loader", default="amimo.dcc.DccApplication", help="Loader class, default: amimo.dcc.DccApplication")
+    parser.add_argument("--skip-synthetic", action="store_true", default=False, help="Skip synthetic methods in all classes.")
+    parser.add_argument("--no-build", action="store_true", default=False, help="Do not build the compiled code")
+    parser.add_argument("--force-keep-libs", action="store_true", default=False, help="Forcefully keep the lib abis defined in Application.mk")
+    parser.add_argument("--source-dir", help="The compiled cpp code output directory.")
+    parser.add_argument("--project-archive", default="project-source.zip", help="Converted cpp code, compressed as zip output file.")
+    parser.add_argument("--disable-signing", action="store_true", default=False, help="Disable APK signing.")
+    parser.add_argument("--allow-global", action="store_true", help="Allow global filter rules like '.*' (not recommended)")
+
+    args = vars(parser.parse_args())
+    input_apk = args["input"]
+    out_apk = args["out"]
+    obfus = args["obfuscate"]
+    filtercfg = args["filter"]
+    custom_loader = args["custom_loader"]
+    SKIP_SYNTHETIC_METHODS = args["skip_synthetic"]
+    IGNORE_APP_LIB_ABIS = args["force_keep_libs"]
+    do_compile = not args["no_build"]
+    source_archive = args["project_archive"]
+    dynamic_register = args["dynamic_register"]
+    disable_signing = args["disable_signing"]
+    allow_global = args["allow_global"]
+    enable_ollvm = False
+    ollvm_flags = ""
+    if args["source_dir"]:
+        project_dir = args["source_dir"]
+    else:
+        project_dir = None
+    dcc_cfg = {}
+    with open("dcc.cfg") as fp:
+        dcc_cfg = json.load(fp)
+    if "ndk_dir" in dcc_cfg and path.exists(dcc_cfg["ndk_dir"]):
+        ndk_dir = dcc_cfg["ndk_dir"]
+        if is_windows():
+            NDKBUILD = path.join(ndk_dir, "ndk-build.cmd")
+        else:
+            NDKBUILD = path.join(ndk_dir, "ndk-build")
+        NDKBUILD = os.path.normpath(NDKBUILD)
+        if not path.exists(NDKBUILD):
+            raise Exception("Invalid ndk_dir path, file not found at " + NDKBUILD)
+    if "apktool" in dcc_cfg and path.exists(dcc_cfg["apktool"]):
+        APKTOOL = dcc_cfg["apktool"]
+    if "ollvm" in dcc_cfg and dcc_cfg["ollvm"]["enable"]:
+        enable_ollvm = True
+        ollvm_flags = dcc_cfg["ollvm"]["flags"]
+    show_logging(level=INFO)
+    create_tmp_directory()
+    if project_dir:
+        if not path.exists(project_dir):
+            copytree("project", project_dir)
+    else:
+        project_dir = make_temp_dir("dcc-project-")
+        rmtree(project_dir)
+        copytree("project", project_dir)
+    try:
+        dcc_main(
+            input_apk, obfus, filtercfg, custom_loader, out_apk, project_dir,
+            do_compile, source_archive, dynamic_register, disable_signing,
+            allow_global, enable_ollvm, ollvm_flags,
+        )
+    except Exception as e:
+        Logger.error("Compile %s failed!" % input_apk, exc_info=True)
+        print(f"{str(e)}")
+    finally:
+        clean_tmp_directory()
