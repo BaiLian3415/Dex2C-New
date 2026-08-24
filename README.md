@@ -74,7 +74,7 @@ Python 3.8 or higher is required for running this tool. So, make sure your pytho
 
 1. Clone the repo.
    ```bash
-   git clone https://github.com/codehasan/dex2c
+   git clone (https://github.com/BaiLian3415/Dex2C-New.git)
    ```
 2. Open the cloned directory.
    ```bash
