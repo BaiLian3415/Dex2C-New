@@ -2,4 +2,3 @@
 
 # Protect all methods in all classes
 # Not recommended for real world applications.
-com.ALuaDefender.*
