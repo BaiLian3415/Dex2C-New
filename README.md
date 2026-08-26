@@ -116,8 +116,6 @@ python dcc.py -a input.apk -o output.apk
 
 ---
 
----
-
 ## 许可证
 
 本项目遵循开源许可证发布。请遵守相关协议使用。
