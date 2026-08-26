@@ -116,23 +116,6 @@ python dcc.py -a input.apk -o output.apk
 
 ---
 
-## 常见问题
-
-### Q: OLLVM 编译时提示内存不足 / Killed
-A: OLLVM 单文件编译峰值约 1.5-2GB。建议：
-- 增加系统内存至 4GB 以上
-- 增加 Swap：`sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`
-- 脚本会自动检测可用内存并限制线程数（低内存强制单线程）
-
-### Q: ndk-build 报错找不到 `libunwind.a`
-A: OLLVM 报告版本 13.0.1，但 NDK r25c 的库在 `lib64/clang/14.0.7/`。脚本已自动创建符号链接 `lib/clang/13.0.1 -> lib64/clang/14.0.7`。若手动安装，请自行创建该链接。
-
-### Q: zipalign 报错缺少 `libc++.so`
-A: 脚本会自动创建 `libc++.so -> libc++.so.1` 符号链接。若失败，手动执行：
-```bash
-sudo ln -s /usr/lib/x86_64-linux-gnu/libc++.so.1 /usr/lib/x86_64-linux-gnu/libc++.so
-```
-
 ---
 
 ## 许可证
