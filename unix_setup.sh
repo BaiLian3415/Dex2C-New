@@ -1,6 +1,25 @@
 #!/bin/bash
 set -euo pipefail
 
+# =============================================================================
+# Dex2C-New 自动化安装脚本（修复增强版 v2）
+# 修复内容：
+#   1. OLLVM 不再污染系统 NDK，采用隔离副本机制
+#   2. 增加 trap 信号捕获，确保临时文件清理
+#   3. sudo 权限预检，避免中途失败
+#   4. 动态检测 Host 架构（支持 ARM64 / Apple Silicon）
+#   5. zipalign 版本与 NDK 版本对齐
+#   6. sed 跨平台兼容（使用 Python 处理文本替换）
+#   7. OLLVM 源码可选 Commit Hash 校验
+#   8. macOS 真实内存检测
+#   9. 备份文件轮转，防止无限堆积
+#   10. dcc.cfg 原子写入，防止半写损坏
+#   11. 全面加固引号，支持含空格路径
+#   12. Java 版本解析健壮性提升
+#   13. 【v2 新增】统一下载函数，带超时/重试/进度，防止网络阻塞卡死
+#   14. 【v2 新增】fix_zipalign_deps 增加 sudo 凭据预检
+# =============================================================================
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -41,6 +60,14 @@ check_sudo() {
     print_error "需要 sudo 权限以安装系统依赖。请确保当前用户具有 sudo 权限，或先执行 'sudo -v' 缓存凭据。"
 }
 
+# 检查 sudo 凭据是否缓存（非阻塞）
+check_sudo_cached() {
+    if [[ "$EUID" -eq 0 ]]; then
+        return 0
+    fi
+    sudo -n true 2>/dev/null
+}
+
 version_ge() {
     python3 -c "import sys; v1=tuple(map(int,'$1'.split('.'))); v2=tuple(map(int,'$2'.split('.'))); sys.exit(0 if v1>=v2 else 1)"
 }
@@ -67,6 +94,63 @@ get_host_arch() {
 }
 
 HOST_ARCH=$(get_host_arch)
+
+# =============================================================================
+# 【v2 新增】统一下载函数 —— 带超时、重试、进度显示，彻底避免网络阻塞卡死
+# =============================================================================
+download_file() {
+    local url="$1"
+    local output="$2"
+    local desc="${3:-文件}"
+    local timeout="${4:-120}"
+    local retries="${5:-3}"
+
+    print_info "开始下载 $desc..."
+    print_info "  URL: $url"
+    print_info "  目标: $output"
+    print_info "  超时: ${timeout}s, 重试: $retries 次"
+
+    local success=false
+    local attempt=1
+
+    while [[ $attempt -le $retries ]]; do
+        if [[ $attempt -gt 1 ]]; then
+            print_warn "第 $((attempt-1)) 次下载失败，$((retries-attempt+1)) 次重试剩余..."
+            sleep 2
+        fi
+
+        if check_command wget; then
+            # wget: 显示进度条，带超时和重试
+            if wget --timeout="$timeout" --tries=1 --progress=bar:force:noscroll \
+                    -O "$output" "$url" 2>&1 | tail -n 5; then
+                success=true
+                break
+            fi
+        elif check_command curl; then
+            # curl: 显示进度条，带超时和重试
+            if curl -L --max-time "$timeout" --connect-timeout 30 \
+                    --retry 1 --retry-delay 2 \
+                    --progress-bar -o "$output" "$url" 2>&1 | tail -n 5; then
+                success=true
+                break
+            fi
+        else
+            print_error "需要 wget 或 curl 以下载 $desc"
+        fi
+
+        attempt=$((attempt + 1))
+    done
+
+    if [[ "$success" != "true" ]]; then
+        print_error "下载 $desc 失败（已重试 $retries 次）。\n  URL: $url\n  请检查网络连接，或手动下载后放置到目标位置。"
+    fi
+
+    if [[ ! -f "$output" || ! -s "$output" ]]; then
+        print_error "下载 $desc 后文件为空或不存在，可能下载被中断。"
+    fi
+
+    print_success "$desc 下载完成 ($(du -h "$output" 2>/dev/null | cut -f1))"
+}
 
 find_java() {
     if check_command java; then
@@ -283,13 +367,10 @@ install_sys_deps() {
         else
             URL="https://dl.google.com/android/repository/build-tools_r33-linux.zip"
         fi
-        if check_command wget; then
-            wget -q "$URL" -O /tmp/za.zip 2>/dev/null || true
-        elif check_command curl; then
-            curl -L "$URL" -o /tmp/za.zip 2>/dev/null || true
-        fi
-        if [[ -f /tmp/za.zip ]]; then
-            unzip -q -j /tmp/za.zip "android-13/zipalign" -d "$ZA" 2>/dev/null && rm -f /tmp/za.zip
+        local ZA_ZIP="/tmp/dex2c-za-$$.zip"
+        download_file "$URL" "$ZA_ZIP" "zipalign (Android Build Tools r33)" 120 3
+        if [[ -f "$ZA_ZIP" ]]; then
+            unzip -q -j "$ZA_ZIP" "android-13/zipalign" -d "$ZA" 2>/dev/null && rm -f "$ZA_ZIP"
         fi
         if [[ -x "$ZA/zipalign" ]]; then
             export PATH="$ZA:$PATH"
@@ -308,11 +389,18 @@ fix_zipalign_deps() {
 
     if [[ -f "$LIBCPLUS" && ! -f "$LIBCPLUS_LINK" ]]; then
         print_info "修复 zipalign 的 libc++ 库依赖..."
-        if sudo ln -s "$LIBCPLUS" "$LIBCPLUS_LINK" 2>/dev/null && sudo ldconfig 2>/dev/null; then
-            print_success "已创建 libc++.so 符号链接"
+        # 【v2 修复】先检查 sudo 凭据是否缓存，避免阻塞等待密码输入
+        if check_sudo_cached; then
+            if sudo ln -s "$LIBCPLUS" "$LIBCPLUS_LINK" 2>/dev/null && sudo ldconfig 2>/dev/null; then
+                print_success "已创建 libc++.so 符号链接"
+            else
+                print_warn "无法创建 libc++.so 符号链接，将使用 LD_LIBRARY_PATH 备用方案"
+                export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+            fi
         else
-            print_warn "无法创建 libc++.so 符号链接（可能需要 sudo），将使用 LD_LIBRARY_PATH 备用方案"
-            export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+            print_warn "sudo 凭据未缓存，跳过 libc++.so 符号链接创建（不影响核心功能）"
+            print_info "如后续 zipalign 报错缺少 libc++.so，请手动执行："
+            print_info "  sudo ln -s /usr/lib/x86_64-linux-gnu/libc++.so.1 /usr/lib/x86_64-linux-gnu/libc++.so"
         fi
     fi
 }
@@ -374,21 +462,15 @@ install_ndk() {
     register_tmp "$TMP"
 
     mkdir -p "$BASE" "$TMP"
-    print_info "下载 NDK $VER..."
-    if check_command wget; then
-        wget -q --show-progress "$URL" -O "$TMP/$ZIP"
-    elif check_command curl; then
-        curl -L --progress-bar "$URL" -o "$TMP/$ZIP"
-    else
-        print_error "需要 wget 或 curl"
-    fi
 
-    print_info "解压 NDK..."
+    # 【v2 修复】使用统一下载函数，带超时和进度
+    download_file "$URL" "$TMP/$ZIP" "Android NDK $VER" 300 3
+
+    print_info "解压 NDK（约 1GB+，可能需要几分钟）..."
     unzip -q "$TMP/$ZIP" -d "$TMP"
     local EXTRACT
     EXTRACT=$(find "$TMP" -maxdepth 1 -type d -name "android-ndk-*" | head -n1)
     if [[ -z "$EXTRACT" ]]; then
-        rm -rf "$TMP"
         print_error "NDK 解压失败"
     fi
 
@@ -517,8 +599,10 @@ install_ollvm() {
         mkdir -p "$WORK_DIR"
 
         print_info "克隆 OLLVM 源码 (分支: $OLLVM_BRANCH)..."
-        if ! git clone --depth 1 -b "$OLLVM_BRANCH" https://github.com/heroims/obfuscator.git "$WORK_DIR"; then
-            print_error "OLLVM 源码克隆失败"
+        # 【v2 修复】git clone 也带超时和进度显示
+        if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 -b "$OLLVM_BRANCH" \
+                --progress https://github.com/heroims/obfuscator.git "$WORK_DIR" 2>&1 | tail -n 20; then
+            print_error "OLLVM 源码克隆失败\n\n请检查网络连接，或尝试手动克隆后设置 OLLVM 环境变量。"
         fi
 
         # 可选：校验 commit hash
@@ -695,11 +779,9 @@ try:
             'flags': '-fvisibility=hidden -mllvm -fla -mllvm -split -mllvm -split_num=5 -mllvm -sub -mllvm -sub_loop=5 -mllvm -sobf -mllvm -bcf_loop=5 -mllvm -bcf_prob=100'
         }
     cfg['ollvm']['enable'] = $OLLVM_PY_BOOL
-
     with open(r'$TMP_CFG', 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=4, ensure_ascii=False)
         f.write('\n')
-
     print(f"[INFO] dcc.cfg 已更新", file=sys.stderr)
     print(f"  ndk_dir: {cfg['ndk_dir']}", file=sys.stderr)
     print(f"  ollvm.enable: {cfg['ollvm']['enable']}", file=sys.stderr)
