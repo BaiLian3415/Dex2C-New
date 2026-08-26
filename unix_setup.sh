@@ -109,7 +109,7 @@ download_file() {
 }
 
 # =============================================================================
-# 【v4 修复】安全解压函数 —— unzip -o + Python zipfile fallback
+# 安全解压函数
 # =============================================================================
 safe_unzip_extract() {
     local zipfile="$1" pattern="$2" destdir="$3"
@@ -461,7 +461,7 @@ install_ndk() {
 }
 
 # =============================================================================
-# 【v4 修复】跨平台安全的文本替换 —— \n 正确转义为真实换行符
+# 【v4 修复】safe_patch_file —— \\n 正确转义为真实换行符
 # =============================================================================
 safe_patch_file() {
     local file="$1" pattern="$2" replacement="$3"
@@ -471,8 +471,6 @@ safe_patch_file() {
         return 1
     fi
 
-    # 使用 Python 进行跨平台安全的文本替换
-    # 【v4 关键修复】将 replacement 中的 \\n 替换为真实的换行符
     python3 << EOF
 import sys
 
@@ -505,7 +503,6 @@ apply_ollvm_patches() {
     local SIGNALS_H="$WORK_DIR/llvm/include/llvm/Support/Signals.h"
     if [[ -f "$SIGNALS_H" ]] && ! grep -q '#include <cstdint>' "$SIGNALS_H"; then
         print_info "应用 OLLVM GCC 13+ 兼容性补丁..."
-        # 【v4 修复】\\n 会被 safe_patch_file 正确转义为换行符
         safe_patch_file "$SIGNALS_H" "#include <string>" "#include <string>\n#include <cstdint>"
         print_success "补丁已应用"
     fi
@@ -552,6 +549,56 @@ rotate_backups() {
     fi
 }
 
+# =============================================================================
+# 【v5 修复】git clone OLLVM 源码 —— 增强诊断、重试、支持本地路径
+# =============================================================================
+clone_ollvm() {
+    local work_dir="$1"
+    local retries="${2:-3}"
+
+    # 如果用户通过环境变量指定了本地源码路径，直接复用
+    if [[ -n "${OLLVM_SOURCE_DIR:-}" && -d "$OLLVM_SOURCE_DIR/llvm" ]]; then
+        print_info "检测到本地 OLLVM 源码目录: $OLLVM_SOURCE_DIR"
+        print_info "复制到工作目录..."
+        cp -r "$OLLVM_SOURCE_DIR"/* "$work_dir/"
+        print_success "已复用本地 OLLVM 源码"
+        return 0
+    fi
+
+    local attempt=1
+    while [[ $attempt -le $retries ]]; do
+        if [[ $attempt -gt 1 ]]; then
+            print_warn "第 $((attempt-1)) 次克隆失败，$((retries-attempt+1)) 次重试剩余..."
+            sleep 3
+        fi
+
+        print_info "尝试克隆 OLLVM 源码 (第 $attempt/$retries 次)..."
+
+        # 清理可能残留的旧目录
+        rm -rf "$work_dir"
+        mkdir -p "$work_dir"
+
+        # 【v5 修复】不使用 tail 截断输出，完整显示错误信息
+        # 同时禁用交互式提示但保留详细输出
+        local clone_output
+        clone_output=$(GIT_TERMINAL_PROMPT=0 git clone --depth 1 -b "$OLLVM_BRANCH" \
+            --progress https://github.com/heroims/obfuscator.git "$work_dir" 2>&1) || true
+
+        # 显示完整输出（包括错误信息）
+        echo "$clone_output" >&2
+
+        if [[ -d "$work_dir/llvm" ]]; then
+            print_success "OLLVM 源码克隆成功"
+            return 0
+        fi
+
+        attempt=$((attempt + 1))
+    done
+
+    # 所有重试都失败了，输出诊断信息
+    print_error "OLLVM 源码克隆失败（已重试 $retries 次）\n\n诊断信息：\n  git 版本: $(git --version 2>/dev/null || echo '未安装')\n  代理设置: ${http_proxy:-'(无)'} / ${https_proxy:-'(无)'}\n  网络测试: 请尝试执行 'git clone --depth 1 -b $OLLVM_BRANCH https://github.com/heroims/obfuscator.git /tmp/test-ollvm' 查看具体错误\n\n解决方案：\n  1. 检查代理设置（http_proxy / https_proxy 环境变量）\n  2. 手动克隆后设置环境变量：export OLLVM_SOURCE_DIR=/path/to/obfuscator\n  3. 使用镜像源：export OLLVM_REPO=https://ghproxy.com/https://github.com/heroims/obfuscator.git"
+}
+
 # ==================== 安装并集成 OLLVM（隔离副本模式） ====================
 install_ollvm() {
     local NDK_PATH="$1"
@@ -577,11 +624,8 @@ install_ollvm() {
         rm -rf "$WORK_DIR"
         mkdir -p "$WORK_DIR"
 
-        print_info "克隆 OLLVM 源码 (分支: $OLLVM_BRANCH)..."
-        if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 -b "$OLLVM_BRANCH" \
-                --progress https://github.com/heroims/obfuscator.git "$WORK_DIR" 2>&1 | tail -n 20; then
-            print_error "OLLVM 源码克隆失败\n\n请检查网络连接，或尝试手动克隆后设置 OLLVM 环境变量。"
-        fi
+        # 【v5 修复】使用增强版 clone 函数
+        clone_ollvm "$WORK_DIR" 3
 
         if [[ -n "$OLLVM_EXPECTED_COMMIT" ]]; then
             local actual_commit; actual_commit=$(cd "$WORK_DIR" && git rev-parse HEAD)
