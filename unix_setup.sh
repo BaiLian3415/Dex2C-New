@@ -1,25 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# =============================================================================
-# Dex2C-New 自动化安装脚本（修复增强版 v2）
-# 修复内容：
-#   1. OLLVM 不再污染系统 NDK，采用隔离副本机制
-#   2. 增加 trap 信号捕获，确保临时文件清理
-#   3. sudo 权限预检，避免中途失败
-#   4. 动态检测 Host 架构（支持 ARM64 / Apple Silicon）
-#   5. zipalign 版本与 NDK 版本对齐
-#   6. sed 跨平台兼容（使用 Python 处理文本替换）
-#   7. OLLVM 源码可选 Commit Hash 校验
-#   8. macOS 真实内存检测
-#   9. 备份文件轮转，防止无限堆积
-#   10. dcc.cfg 原子写入，防止半写损坏
-#   11. 全面加固引号，支持含空格路径
-#   12. Java 版本解析健壮性提升
-#   13. 【v2 新增】统一下载函数，带超时/重试/进度，防止网络阻塞卡死
-#   14. 【v2 新增】fix_zipalign_deps 增加 sudo 凭据预检
-# =============================================================================
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -51,20 +32,14 @@ trap cleanup EXIT INT TERM HUP
 
 # 检查 sudo 权限（在需要时）
 check_sudo() {
-    if [[ "$EUID" -eq 0 ]]; then
-        return 0
-    fi
-    if sudo -n true 2>/dev/null; then
-        return 0
-    fi
+    if [[ "$EUID" -eq 0 ]]; then return 0; fi
+    if sudo -n true 2>/dev/null; then return 0; fi
     print_error "需要 sudo 权限以安装系统依赖。请确保当前用户具有 sudo 权限，或先执行 'sudo -v' 缓存凭据。"
 }
 
 # 检查 sudo 凭据是否缓存（非阻塞）
 check_sudo_cached() {
-    if [[ "$EUID" -eq 0 ]]; then
-        return 0
-    fi
+    if [[ "$EUID" -eq 0 ]]; then return 0; fi
     sudo -n true 2>/dev/null
 }
 
@@ -73,71 +48,54 @@ version_ge() {
 }
 
 abs_path() {
-    if [[ "$1" = /* ]]; then
-        echo "$1"
-    else
-        echo "$(pwd)/$1"
-    fi
+    if [[ "$1" = /* ]]; then echo "$1"; else echo "$(pwd)/$1"; fi
 }
 
 # 动态检测 Host 架构
 get_host_arch() {
-    local arch
-    arch=$(uname -m)
+    local arch; arch=$(uname -m)
     case "$arch" in
-        x86_64)  echo "x86_64" ;;
-        amd64)   echo "x86_64" ;;
-        aarch64) echo "arm64"  ;;
-        arm64)   echo "arm64"  ;;
-        *)       echo "$arch"  ;;
+        x86_64|amd64) echo "x86_64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *) echo "$arch" ;;
     esac
 }
 
 HOST_ARCH=$(get_host_arch)
 
 # =============================================================================
-# 【v2 新增】统一下载函数 —— 带超时、重试、进度显示，彻底避免网络阻塞卡死
+# 【v3 修复】统一下载函数 —— 带超时/重试，使用 dot 进度避免终端异常
 # =============================================================================
 download_file() {
-    local url="$1"
-    local output="$2"
-    local desc="${3:-文件}"
-    local timeout="${4:-120}"
-    local retries="${5:-3}"
+    local url="$1" output="$2" desc="${3:-文件}" timeout="${4:-120}" retries="${5:-3}"
 
     print_info "开始下载 $desc..."
     print_info "  URL: $url"
     print_info "  目标: $output"
     print_info "  超时: ${timeout}s, 重试: $retries 次"
 
-    local success=false
-    local attempt=1
-
+    local success=false attempt=1
     while [[ $attempt -le $retries ]]; do
         if [[ $attempt -gt 1 ]]; then
-            print_warn "第 $((attempt-1)) 次下载失败，$((retries-attempt+1)) 次重试剩余..."
+            print_warn "第 $((attempt-1)) 次下载失败，剩余 $((retries-attempt+1)) 次重试..."
             sleep 2
         fi
 
         if check_command wget; then
-            # wget: 显示进度条，带超时和重试
-            if wget --timeout="$timeout" --tries=1 --progress=bar:force:noscroll \
-                    -O "$output" "$url" 2>&1 | tail -n 5; then
-                success=true
-                break
+            # 【v3 修复】使用 dot:giga 进度，避免 bar:noscroll 在某些终端异常
+            if wget --timeout="$timeout" --tries=1 --progress=dot:giga \
+                    -O "$output" "$url" 2>&1 | tail -n 10; then
+                success=true; break
             fi
         elif check_command curl; then
-            # curl: 显示进度条，带超时和重试
             if curl -L --max-time "$timeout" --connect-timeout 30 \
                     --retry 1 --retry-delay 2 \
-                    --progress-bar -o "$output" "$url" 2>&1 | tail -n 5; then
-                success=true
-                break
+                    --progress-bar -o "$output" "$url" 2>&1 | tail -n 10; then
+                success=true; break
             fi
         else
             print_error "需要 wget 或 curl 以下载 $desc"
         fi
-
         attempt=$((attempt + 1))
     done
 
@@ -149,46 +107,110 @@ download_file() {
         print_error "下载 $desc 后文件为空或不存在，可能下载被中断。"
     fi
 
-    print_success "$desc 下载完成 ($(du -h "$output" 2>/dev/null | cut -f1))"
+    local fsize
+    fsize=$(du -h "$output" 2>/dev/null | cut -f1)
+    print_success "$desc 下载完成 ($fsize)"
+}
+
+# =============================================================================
+# 【v3 新增】安全解压函数 —— 带强制覆盖 + Python fallback，防止 unzip 卡死
+# =============================================================================
+safe_unzip_extract() {
+    local zipfile="$1"
+    local pattern="$2"
+    local destdir="$3"
+
+    print_info "解压: $pattern 从 $zipfile 到 $destdir"
+
+    # 确保目标目录存在
+    mkdir -p "$destdir"
+
+    # 先删除已存在的目标文件，避免 unzip 交互式覆盖提示卡死
+    local basename
+    basename=$(basename "$pattern")
+    if [[ -f "$destdir/$basename" ]]; then
+        print_info "  删除已存在的 $destdir/$basename"
+        rm -f "$destdir/$basename"
+    fi
+
+    # 方法 1: unzip -o 强制覆盖
+    if check_command unzip; then
+        print_info "  使用 unzip 提取..."
+        if unzip -o -q -j "$zipfile" "$pattern" -d "$destdir" 2>/dev/null; then
+            print_success "  unzip 提取成功"
+            return 0
+        else
+            print_warn "  unzip 提取失败，尝试备用方案..."
+        fi
+    fi
+
+    # 方法 2: Python zipfile 模块（跨平台，无交互式提示问题）
+    if check_command python3; then
+        print_info "  使用 Python zipfile 提取..."
+        if python3 -c "
+import zipfile, sys, os
+zip_path = r'$zipfile'
+pattern = r'$pattern'
+dest = r'$destdir'
+try:
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        found = [n for n in z.namelist() if n.endswith(pattern) or n == pattern]
+        if not found:
+            # 尝试直接匹配
+            found = [n for n in z.namelist() if pattern in n]
+        if not found:
+            print(f'ERROR: 在 zip 中未找到匹配 {pattern} 的文件')
+            sys.exit(1)
+        for name in found:
+            data = z.read(name)
+            out_path = os.path.join(dest, os.path.basename(name))
+            with open(out_path, 'wb') as f:
+                f.write(data)
+            print(f'EXTRACTED: {name} -> {out_path}')
+except Exception as e:
+    print(f'ERROR: {e}')
+    sys.exit(1)
+" 2>&1; then
+            print_success "  Python zipfile 提取成功"
+            return 0
+        else
+            print_warn "  Python zipfile 提取也失败了"
+        fi
+    fi
+
+    # 方法 3: 7z
+    if check_command 7z; then
+        print_info "  使用 7z 提取..."
+        if 7z e -o"$destdir" -y "$zipfile" "$pattern" 2>/dev/null; then
+            print_success "  7z 提取成功"
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 find_java() {
-    if check_command java; then
-        echo "java"
-        return 0
-    fi
+    if check_command java; then echo "java"; return 0; fi
     if [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/java" ]]; then
-        echo "$JAVA_HOME/bin/java"
-        return 0
+        echo "$JAVA_HOME/bin/java"; return 0
     fi
     local candidates=(
-        /usr/bin/java
-        /usr/lib/jvm/*/bin/java
-        /usr/lib/jvm/java-*/bin/java
-        /opt/jdk*/bin/java
-        /opt/openjdk*/bin/java
-        "$HOME/.sdkman/candidates/java/*/bin/java"
+        /usr/bin/java /usr/lib/jvm/*/bin/java /usr/lib/jvm/java-*/bin/java
+        /opt/jdk*/bin/java /opt/openjdk*/bin/java "$HOME/.sdkman/candidates/java/*/bin/java"
     )
     for c in "${candidates[@]}"; do
         for f in $c; do
-            if [[ -x "$f" ]]; then
-                echo "$f"
-                return 0
-            fi
+            if [[ -x "$f" ]]; then echo "$f"; return 0; fi
         done
     done
     return 1
 }
 
-# 更健壮的 Java 版本检测
 get_java_major_version() {
     local java_cmd="$1"
-    local version_str
-    version_str=$("$java_cmd" -version 2>&1)
-    # 提取版本号，处理多种格式："17.0.8", "1.8.0_361", "21.0.2+13-LTS"
-    local ver
-    ver=$(echo "$version_str" | grep -i "version" | head -n1 | sed -E 's/.*"([0-9]+)(\.[0-9]+)*.*/\1/')
-    # 处理 1.8 风格
+    local version_str; version_str=$("$java_cmd" -version 2>&1)
+    local ver; ver=$(echo "$version_str" | grep -i "version" | head -n1 | sed -E 's/.*"([0-9]+)(\.[0-9]+)*.*/\1/')
     if [[ "$ver" == "1" ]]; then
         ver=$(echo "$version_str" | grep -i "version" | head -n1 | sed -E 's/.*"1\.([0-9]+).*/\1/')
     fi
@@ -197,17 +219,11 @@ get_java_major_version() {
 
 detect_os() {
     if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        if command -v apt &> /dev/null; then
-            echo "linux_apt"
-        elif command -v dnf &> /dev/null; then
-            echo "linux_yum"
-        elif command -v yum &> /dev/null; then
-            echo "linux_yum"
-        elif command -v pacman &> /dev/null; then
-            echo "linux_pacman"
-        else
-            print_error "不支持的 Linux 发行版"
-        fi
+        if command -v apt &> /dev/null; then echo "linux_apt"
+        elif command -v dnf &> /dev/null; then echo "linux_yum"
+        elif command -v yum &> /dev/null; then echo "linux_yum"
+        elif command -v pacman &> /dev/null; then echo "linux_pacman"
+        else print_error "不支持的 Linux 发行版"; fi
     elif [[ "$OSTYPE" == "darwin"* ]]; then
         check_command brew && echo "macos" || print_error "macOS 需要先安装 Homebrew"
     else
@@ -219,11 +235,9 @@ OS_TYPE=$(detect_os)
 print_info "检测到系统: $OS_TYPE, 架构: $HOST_ARCH"
 
 OLLVM_BRANCH="llvm-13.x"
-# 可选：设置 OLLVM 期望的 commit hash 以校验源码完整性
-# 获取方式：git ls-remote https://github.com/heroims/obfuscator.git llvm-13.x
 OLLVM_EXPECTED_COMMIT="${OLLVM_EXPECTED_COMMIT:-}"
 
-# ==================== 检查 apktool（不自动下载） ====================
+# ==================== 检查 apktool ====================
 check_apktool() {
     local TOOLS_DIR="tools"
     local JAR="$TOOLS_DIR/apktool.jar"
@@ -285,22 +299,14 @@ EOF
 # ==================== 系统依赖 ====================
 install_sys_deps() {
     print_info "检查系统依赖..."
-    if ! check_command python3; then
-        print_error "Python3 未安装"
-    fi
-    local PY_VER
-    PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    if ! version_ge "$PY_VER" "3.8"; then
-        print_error "Python $PY_VER < 3.8"
-    fi
+    if ! check_command python3; then print_error "Python3 未安装"; fi
+    local PY_VER; PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    if ! version_ge "$PY_VER" "3.8"; then print_error "Python $PY_VER < 3.8"; fi
     print_success "Python $PY_VER OK"
 
-    local need_jdk=true
-    local JAVA_CMD
-    JAVA_CMD=$(find_java) || true
+    local need_jdk=true JAVA_CMD; JAVA_CMD=$(find_java) || true
     if [[ -n "$JAVA_CMD" ]]; then
-        local jv
-        jv=$(get_java_major_version "$JAVA_CMD")
+        local jv; jv=$(get_java_major_version "$JAVA_CMD")
         if [[ "$jv" =~ ^[0-9]+$ && "$jv" -ge 17 ]]; then
             print_success "Java $jv OK（跳过 JDK 安装）"
             need_jdk=false
@@ -323,62 +329,32 @@ install_sys_deps() {
                 elif apt-cache search --names-only '^default-jdk$' 2>/dev/null | grep -q 'default-jdk'; then
                     jdk="default-jdk"
                 fi
-                if [[ -n "$jdk" ]]; then
-                    pkgs+=("$jdk")
-                else
-                    print_warn "apt 源中未找到 JDK 包，请手动安装 JDK 17+"
-                fi
+                if [[ -n "$jdk" ]]; then pkgs+=("$jdk")
+                else print_warn "apt 源中未找到 JDK 包，请手动安装 JDK 17+"; fi
             fi
             pkgs+=(python3 python3-pip python3-venv build-essential cmake git wget unzip)
             sudo apt-get install -y "${pkgs[@]}" || print_error "apt 安装失败"
             ;;
         linux_yum)
             check_sudo
-            if [[ "$need_jdk" == true ]]; then
-                sudo yum install -y java-17-openjdk-devel || true
-            fi
+            [[ "$need_jdk" == true ]] && sudo yum install -y java-17-openjdk-devel || true
             sudo yum install -y python3 python3-pip python3-virtualenv gcc-c++ make cmake git wget unzip || print_error "yum 失败"
             ;;
         linux_pacman)
             check_sudo
-            if [[ "$need_jdk" == true ]]; then
-                sudo pacman -Sy --noconfirm jdk17-openjdk || true
-            fi
+            [[ "$need_jdk" == true ]] && sudo pacman -Sy --noconfirm jdk17-openjdk || true
             sudo pacman -Sy --noconfirm python python-pip python-virtualenv base-devel cmake git wget unzip || print_error "pacman 失败"
             ;;
         macos)
-            if [[ "$need_jdk" == true ]]; then
-                brew install openjdk@17
-            fi
+            [[ "$need_jdk" == true ]] && brew install openjdk@17
             brew install python3 cmake git wget unzip
             ;;
     esac
 
-    # 修复 zipalign 的 libc++ 依赖问题
+    print_info "[步骤] 修复 zipalign 的 libc++ 依赖..."
     fix_zipalign_deps
-
-    # 安装 zipalign（如果系统没有）
-    if ! check_command zipalign; then
-        local ZA="$HOME/.local/bin"
-        mkdir -p "$ZA"
-        local URL
-        if [[ "$OS_TYPE" == "macos" ]]; then
-            URL="https://dl.google.com/android/repository/build-tools_r33-macosx.zip"
-        else
-            URL="https://dl.google.com/android/repository/build-tools_r33-linux.zip"
-        fi
-        local ZA_ZIP="/tmp/dex2c-za-$$.zip"
-        download_file "$URL" "$ZA_ZIP" "zipalign (Android Build Tools r33)" 120 3
-        if [[ -f "$ZA_ZIP" ]]; then
-            unzip -q -j "$ZA_ZIP" "android-13/zipalign" -d "$ZA" 2>/dev/null && rm -f "$ZA_ZIP"
-        fi
-        if [[ -x "$ZA/zipalign" ]]; then
-            export PATH="$ZA:$PATH"
-            print_success "zipalign 已安装到 $ZA"
-        else
-            print_warn "zipalign 安装失败，请手动安装 Android SDK build-tools"
-        fi
-    fi
+    print_info "[步骤] 检查/安装 zipalign..."
+    install_zipalign
     print_success "系统依赖检查完成"
 }
 
@@ -389,7 +365,6 @@ fix_zipalign_deps() {
 
     if [[ -f "$LIBCPLUS" && ! -f "$LIBCPLUS_LINK" ]]; then
         print_info "修复 zipalign 的 libc++ 库依赖..."
-        # 【v2 修复】先检查 sudo 凭据是否缓存，避免阻塞等待密码输入
         if check_sudo_cached; then
             if sudo ln -s "$LIBCPLUS" "$LIBCPLUS_LINK" 2>/dev/null && sudo ldconfig 2>/dev/null; then
                 print_success "已创建 libc++.so 符号链接"
@@ -402,6 +377,43 @@ fix_zipalign_deps() {
             print_info "如后续 zipalign 报错缺少 libc++.so，请手动执行："
             print_info "  sudo ln -s /usr/lib/x86_64-linux-gnu/libc++.so.1 /usr/lib/x86_64-linux-gnu/libc++.so"
         fi
+    fi
+}
+
+# ==================== 安装 zipalign（v3 修复：防卡死） ====================
+install_zipalign() {
+    if check_command zipalign; then
+        print_success "zipalign 已在 PATH 中，跳过安装"
+        return 0
+    fi
+
+    local ZA="$HOME/.local/bin"
+    local URL
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        URL="https://dl.google.com/android/repository/build-tools_r33-macosx.zip"
+    else
+        URL="https://dl.google.com/android/repository/build-tools_r33-linux.zip"
+    fi
+    local ZA_ZIP="/tmp/dex2c-za-$$.zip"
+
+    download_file "$URL" "$ZA_ZIP" "zipalign (Android Build Tools r33)" 120 3
+
+    # 【v3 修复】使用 safe_unzip_extract 替代裸 unzip，防卡死
+    if safe_unzip_extract "$ZA_ZIP" "android-13/zipalign" "$ZA"; then
+        rm -f "$ZA_ZIP"
+    else
+        rm -f "$ZA_ZIP"
+        print_warn "zipalign 自动安装失败，请手动安装 Android SDK build-tools"
+        return 1
+    fi
+
+    if [[ -x "$ZA/zipalign" ]]; then
+        chmod +x "$ZA/zipalign"
+        export PATH="$ZA:$PATH"
+        print_success "zipalign 已安装到 $ZA"
+    else
+        print_warn "zipalign 安装后验证失败"
+        return 1
     fi
 }
 
@@ -438,20 +450,14 @@ install_ndk() {
 
     if [[ -d "$DIR" && -x "$DIR/ndk-build" ]]; then
         print_success "NDK 已存在: $DIR"
-        echo "$DIR"
-        return 0
+        echo "$DIR"; return 0
     fi
 
     if check_command ndk-build; then
-        local EXIST
-        EXIST=$(dirname "$(command -v ndk-build)")
+        local EXIST; EXIST=$(dirname "$(command -v ndk-build)")
         print_warn "检测到系统 NDK: $EXIST"
-        read -rp "使用现有 NDK？(Y/n) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            echo "$EXIST"
-            return 0
-        fi
+        read -rp "使用现有 NDK？(Y/n) " -n 1 -r; echo
+        [[ ! $REPLY =~ ^[Nn]$ ]] && echo "$EXIST" && return 0
     fi
 
     local PLAT="linux"
@@ -462,54 +468,38 @@ install_ndk() {
     register_tmp "$TMP"
 
     mkdir -p "$BASE" "$TMP"
-
-    # 【v2 修复】使用统一下载函数，带超时和进度
     download_file "$URL" "$TMP/$ZIP" "Android NDK $VER" 300 3
 
     print_info "解压 NDK（约 1GB+，可能需要几分钟）..."
     unzip -q "$TMP/$ZIP" -d "$TMP"
-    local EXTRACT
-    EXTRACT=$(find "$TMP" -maxdepth 1 -type d -name "android-ndk-*" | head -n1)
-    if [[ -z "$EXTRACT" ]]; then
-        print_error "NDK 解压失败"
-    fi
+    local EXTRACT; EXTRACT=$(find "$TMP" -maxdepth 1 -type d -name "android-ndk-*" | head -n1)
+    [[ -z "$EXTRACT" ]] && print_error "NDK 解压失败"
 
     [[ -d "$DIR" ]] && rm -rf "$DIR"
     mv "$EXTRACT" "$DIR"
-    # TMP 目录会在 trap 中清理
 
     [[ -x "$DIR/ndk-build" ]] || print_error "NDK 验证失败"
     print_success "NDK 安装完成: $DIR"
     echo "$DIR"
 }
 
-# ==================== 跨平台安全的文本替换（替代 sed -i） ====================
+# ==================== 跨平台安全的文本替换 ====================
 safe_patch_file() {
-    local file="$1"
-    local pattern="$2"
-    local replacement="$3"
-
-    if [[ ! -f "$file" ]]; then
-        print_warn "补丁目标文件不存在: $file"
-        return 1
-    fi
-
-    # 使用 Python 进行跨平台安全的文本替换
+    local file="$1" pattern="$2" replacement="$3"
+    if [[ ! -f "$file" ]]; then print_warn "补丁目标文件不存在: $file"; return 1; fi
     python3 << EOF
 import sys
 with open(r"$file", 'r', encoding='utf-8', errors='ignore') as f:
     content = f.read()
-if r"$pattern" not in content:
-    sys.exit(0)
-if r"$replacement" in content:
-    sys.exit(0)  # 已打过补丁
+if r"$pattern" not in content: sys.exit(0)
+if r"$replacement" in content: sys.exit(0)
 content = content.replace(r"$pattern", r"$replacement")
 with open(r"$file", 'w', encoding='utf-8') as f:
     f.write(content)
 EOF
 }
 
-# ==================== 修复 OLLVM GCC 13+ 兼容性补丁 ====================
+# ==================== OLLVM 补丁 ====================
 apply_ollvm_patches() {
     local WORK_DIR="$1"
     local SIGNALS_H="$WORK_DIR/llvm/include/llvm/Support/Signals.h"
@@ -522,16 +512,12 @@ apply_ollvm_patches() {
 
 # ==================== 计算安全的编译线程数 ====================
 calc_safe_jobs() {
-    local cpu
-    cpu=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
-    local mem_mb
-    mem_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}' || echo 0)
+    local cpu; cpu=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
+    local mem_mb; mem_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}' || echo 0)
 
     if [[ "$mem_mb" -eq 0 ]]; then
-        # macOS 或其他没有 free 的系统
         if [[ "$OS_TYPE" == "macos" ]]; then
-            local mem_bytes
-            mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 4294967296)
+            local mem_bytes; mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 4294967296)
             mem_mb=$((mem_bytes / 1024 / 1024))
         else
             mem_mb=4096
@@ -543,11 +529,9 @@ calc_safe_jobs() {
     [[ "$safe_jobs" -gt "$cpu" ]] && safe_jobs="$cpu"
 
     if [[ "$mem_mb" -lt 2048 ]]; then
-        safe_jobs=1
-        print_warn "可用内存仅 ${mem_mb}MB，强制单线程编译防止 OOM"
+        safe_jobs=1; print_warn "可用内存仅 ${mem_mb}MB，强制单线程编译防止 OOM"
     elif [[ "$mem_mb" -lt 4096 ]]; then
-        safe_jobs=1
-        print_warn "可用内存仅 ${mem_mb}MB，限制为单线程编译（OLLVM 峰值内存消耗大）"
+        safe_jobs=1; print_warn "可用内存仅 ${mem_mb}MB，限制为单线程编译"
     elif [[ "$safe_jobs" -eq 1 ]]; then
         print_warn "可用内存 ${mem_mb}MB，限制为单线程编译"
     else
@@ -558,12 +542,8 @@ calc_safe_jobs() {
 
 # ==================== 备份文件轮转 ====================
 rotate_backups() {
-    local target_dir="$1"
-    local pattern="$2"
-    local max_backups="${3:-5}"
-
-    local count
-    count=$(find "$target_dir" -maxdepth 1 -name "$pattern" -type f 2>/dev/null | wc -l)
+    local target_dir="$1" pattern="$2" max_backups="${3:-5}"
+    local count; count=$(find "$target_dir" -maxdepth 1 -name "$pattern" -type f 2>/dev/null | wc -l)
     if [[ "$count" -ge "$max_backups" ]]; then
         print_info "备份文件超过 ${max_backups} 个，清理旧备份..."
         find "$target_dir" -maxdepth 1 -name "$pattern" -type f -printf '%T@ %p\n' 2>/dev/null | \
@@ -575,12 +555,10 @@ rotate_backups() {
 install_ollvm() {
     local NDK_PATH="$1"
     local INSTALL_DIR="$HOME/Android/ollvm"
-    local ORIGINAL_DIR
-    ORIGINAL_DIR=$(pwd)
+    local ORIGINAL_DIR; ORIGINAL_DIR=$(pwd)
 
     print_info "安装 OLLVM ($OLLVM_BRANCH) ..."
 
-    # 定位 NDK clang 目录
     local NDK_CLANG_DIR=""
     NDK_CLANG_DIR=$(find "$NDK_PATH/toolchains/llvm/prebuilt" -maxdepth 2 -name "bin" -type d 2>/dev/null | head -n1 || true)
     if [[ -z "$NDK_CLANG_DIR" || ! -d "$NDK_CLANG_DIR" ]]; then
@@ -599,25 +577,20 @@ install_ollvm() {
         mkdir -p "$WORK_DIR"
 
         print_info "克隆 OLLVM 源码 (分支: $OLLVM_BRANCH)..."
-        # 【v2 修复】git clone 也带超时和进度显示
         if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 -b "$OLLVM_BRANCH" \
                 --progress https://github.com/heroims/obfuscator.git "$WORK_DIR" 2>&1 | tail -n 20; then
             print_error "OLLVM 源码克隆失败\n\n请检查网络连接，或尝试手动克隆后设置 OLLVM 环境变量。"
         fi
 
-        # 可选：校验 commit hash
         if [[ -n "$OLLVM_EXPECTED_COMMIT" ]]; then
-            local actual_commit
-            actual_commit=$(cd "$WORK_DIR" && git rev-parse HEAD)
+            local actual_commit; actual_commit=$(cd "$WORK_DIR" && git rev-parse HEAD)
             if [[ "$actual_commit" != "$OLLVM_EXPECTED_COMMIT" ]]; then
-                print_error "OLLVM 源码校验失败！\n  期望: $OLLVM_EXPECTED_COMMIT\n  实际: $actual_commit\n\n仓库可能已被篡改，请检查 OLLVM_EXPECTED_COMMIT 配置。"
+                print_error "OLLVM 源码校验失败！\n  期望: $OLLVM_EXPECTED_COMMIT\n  实际: $actual_commit"
             fi
             print_success "OLLVM 源码 commit hash 校验通过"
         fi
 
-        if [[ ! -d "$WORK_DIR/llvm" ]]; then
-            print_error "OLLVM 源码结构异常"
-        fi
+        if [[ ! -d "$WORK_DIR/llvm" ]]; then print_error "OLLVM 源码结构异常"; fi
 
         apply_ollvm_patches "$WORK_DIR"
 
@@ -636,8 +609,7 @@ install_ollvm() {
             print_error "OLLVM CMake 配置失败"
         fi
 
-        local JOBS
-        JOBS=$(calc_safe_jobs)
+        local JOBS; JOBS=$(calc_safe_jobs)
 
         print_info "开始编译 OLLVM，请耐心等待（首次编译耗时较长）..."
         if ! make -j"$JOBS"; then
@@ -655,9 +627,7 @@ install_ollvm() {
         print_success "OLLVM 编译安装完成: $INSTALL_DIR"
     fi
 
-    # 创建隔离的 NDK 副本用于 OLLVM，避免污染原始 NDK
-    local OLLVM_NDK_DIR
-    OLLVM_NDK_DIR="$(dirname "$NDK_PATH")/$(basename "$NDK_PATH")-ollvm"
+    local OLLVM_NDK_DIR; OLLVM_NDK_DIR="$(dirname "$NDK_PATH")/$(basename "$NDK_PATH")-ollvm"
 
     if [[ -d "$OLLVM_NDK_DIR" && -x "$OLLVM_NDK_DIR/ndk-build" ]]; then
         print_success "OLLVM NDK 副本已存在: $OLLVM_NDK_DIR"
@@ -667,25 +637,21 @@ install_ollvm() {
         print_info "源 NDK: $NDK_PATH"
         print_info "目标: $OLLVM_NDK_DIR"
 
-        # 尝试使用硬链接节省空间（Linux），失败则回退到完整复制
         if cp -rl "$NDK_PATH" "$OLLVM_NDK_DIR" 2>/dev/null; then
             print_success "已使用硬链接创建 NDK 副本（节省空间）"
         else
-            print_warn "硬链接复制失败（可能是跨文件系统或不支持），使用完整复制..."
+            print_warn "硬链接复制失败，使用完整复制..."
             cp -r "$NDK_PATH" "$OLLVM_NDK_DIR"
         fi
 
-        # 在副本中替换 clang
         local OLLVM_CLANG_DIR
         OLLVM_CLANG_DIR=$(find "$OLLVM_NDK_DIR/toolchains/llvm/prebuilt" -maxdepth 2 -name "bin" -type d 2>/dev/null | head -n1 || true)
 
         if [[ -n "$OLLVM_CLANG_DIR" && -d "$OLLVM_CLANG_DIR" ]]; then
-            # 轮转备份
             rotate_backups "$OLLVM_CLANG_DIR" "clang.bak.*" 3
             rotate_backups "$OLLVM_CLANG_DIR" "clang++.bak.*" 3
 
-            local BAK_DATE
-            BAK_DATE=$(date +%Y%m%d%H%M%S)
+            local BAK_DATE; BAK_DATE=$(date +%Y%m%d%H%M%S)
             [[ -x "$OLLVM_CLANG_DIR/clang" ]] && cp "$OLLVM_CLANG_DIR/clang" "$OLLVM_CLANG_DIR/clang.bak.$BAK_DATE"
             [[ -x "$OLLVM_CLANG_DIR/clang++" ]] && cp "$OLLVM_CLANG_DIR/clang++" "$OLLVM_CLANG_DIR/clang++.bak.$BAK_DATE"
 
@@ -695,7 +661,6 @@ install_ollvm() {
             print_success "OLLVM 已集成到隔离 NDK 副本"
             print_info "原 clang 已备份: clang.bak.$BAK_DATE / clang++.bak.$BAK_DATE"
 
-            # 修复 OLLVM 版本号与 NDK 库路径不匹配问题
             fix_ollvm_lib_path "$OLLVM_NDK_DIR"
             NDK_PATH="$OLLVM_NDK_DIR"
         else
@@ -723,7 +688,6 @@ fix_ollvm_lib_path() {
     local LIB_DIR="$PREBUILT_DIR/lib"
     local LIB64_DIR="$PREBUILT_DIR/lib64"
 
-    # 查找 NDK 中实际存在的 clang 库版本目录（如 14.0.7）
     local REAL_VER=""
     if [[ -d "$LIB64_DIR/clang" ]]; then
         REAL_VER=$(find "$LIB64_DIR/clang" -maxdepth 1 -type d 2>/dev/null | grep -v "^$LIB64_DIR/clang$" | head -n1 | xargs basename 2>/dev/null || true)
@@ -734,14 +698,10 @@ fix_ollvm_lib_path() {
         return 0
     fi
 
-    # OLLVM 报告版本为 13.0.1，ndk-build 会去找 lib/clang/13.0.1/
-    # 需要创建 lib/clang/13.0.1 -> lib64/clang/实际版本 的符号链接
     if [[ ! -d "$LIB_DIR/clang/13.0.1" ]]; then
         print_info "修复 OLLVM 版本号与 NDK 库路径不匹配..."
         mkdir -p "$LIB_DIR/clang"
-        if [[ -d "$LIB_DIR/clang/13.0.1" ]]; then
-            rm -rf "$LIB_DIR/clang/13.0.1"
-        fi
+        if [[ -d "$LIB_DIR/clang/13.0.1" ]]; then rm -rf "$LIB_DIR/clang/13.0.1"; fi
         ln -s "$LIB64_DIR/clang/$REAL_VER" "$LIB_DIR/clang/13.0.1"
         print_success "已创建库路径符号链接: lib/clang/13.0.1 -> lib64/clang/$REAL_VER"
     else
@@ -751,23 +711,18 @@ fix_ollvm_lib_path() {
 
 # ==================== 配置 dcc.cfg（原子写入） ====================
 configure_dcc() {
-    local NDK_PATH="$1"
-    local OLLVM_ENABLE="${2:-false}"
-    local BACKUP_SUFFIX
-    BACKUP_SUFFIX=$(date +%Y%m%d%H%M%S)
+    local NDK_PATH="$1" OLLVM_ENABLE="${2:-false}"
+    local BACKUP_SUFFIX; BACKUP_SUFFIX=$(date +%Y%m%d%H%M%S)
 
-    # 轮转旧备份
     rotate_backups "." "dcc.cfg.bak.*" 5
     cp dcc.cfg "dcc.cfg.bak.$BACKUP_SUFFIX" 2>/dev/null || true
 
     local OLLVM_PY_BOOL="False"
     [[ "$OLLVM_ENABLE" == "true" ]] && OLLVM_PY_BOOL="True"
 
-    # 原子写入：先写入临时文件，再重命名
     local TMP_CFG="dcc.cfg.tmp.$$"
     python3 << EOF
 import json, sys
-
 try:
     with open('dcc.cfg', 'r', encoding='utf-8') as f:
         cfg = json.load(f)
@@ -792,7 +747,6 @@ except Exception as e:
     sys.exit(1)
 EOF
 
-    # 原子替换
     mv "$TMP_CFG" dcc.cfg
     print_success "dcc.cfg 配置完成"
 }
@@ -826,8 +780,7 @@ final_check() {
 main() {
     if [[ ! -f "dcc.py" ]]; then
         print_warn "未检测到 dcc.py，请确保在 Dex2C-New 仓库根目录运行"
-        read -rp "是否继续？(y/N) " -n 1 -r
-        echo
+        read -rp "是否继续？(y/N) " -n 1 -r; echo
         [[ $REPLY =~ ^[Yy]$ ]] || exit 1
     fi
 
@@ -840,11 +793,9 @@ main() {
         [[ -z "$choice" ]] && choice="1"
     done
 
-    local ENABLE_OLLVM="false"
-    local NDK_VERSION="r27c"
+    local ENABLE_OLLVM="false" NDK_VERSION="r27c"
     if [[ "$choice" == "2" ]]; then
-        ENABLE_OLLVM="true"
-        NDK_VERSION="r25c"
+        ENABLE_OLLVM="true"; NDK_VERSION="r25c"
         print_info "已选择 OLLVM 模式（NDK $NDK_VERSION + OLLVM $OLLVM_BRANCH）"
     else
         print_info "已选择普通模式（NDK $NDK_VERSION）"
@@ -853,11 +804,8 @@ main() {
     check_repo_integrity
     install_sys_deps
 
-    local VENV_PATH
-    VENV_PATH=$(install_python_deps "requirements.txt" ".venv")
-
-    local NDK_PATH
-    NDK_PATH=$(install_ndk "$NDK_VERSION" "$HOME/Android/Sdk/ndk")
+    local VENV_PATH; VENV_PATH=$(install_python_deps "requirements.txt" ".venv")
+    local NDK_PATH; NDK_PATH=$(install_ndk "$NDK_VERSION" "$HOME/Android/Sdk/ndk")
 
     if [[ "$ENABLE_OLLVM" == "true" ]]; then
         NDK_PATH=$(install_ollvm "$NDK_PATH")
