@@ -1,263 +1,165 @@
-<a name="readme-top"></a>
+# Dex2C-New
 
-<div align="center">
-  <h1 align="center">𝐃𝐞𝐱𝟐𝐂</h1>
+> 将 Android APK 中的 Dalvik 字节码转换为 Native C 代码并重新编译，提升代码安全性。
 
+---
 
+## 致谢
 
+- **[amimo](https://github.com/amimo/dcc)** —— Dex2C 原始作者，感谢其开创性的 Dalvik-to-C 转换方案与核心实现。
+- **[iBotPeaches](https://github.com/iBotPeaches/Apktool)** —— Apktool 作者，提供 APK 反编译/回编译基础工具。
+- **[heroims](https://github.com/heroims/obfuscator)** —— OLLVM (obfuscator) 维护者，提供 LLVM 13.x 混淆支持。
 
-[![Stars](https://img.shields.io/github/stars/codehasan/Dex2C?color=yellow)](https://github.com/TeamUltroid/Ultroid/stargazers)
-[![Python](https://img.shields.io/badge/Python-v3.10.3-blue)](https://www.python.org/)
-[![Forks](https://img.shields.io/github/forks/codehasan/Dex2C?color=orange)](https://github.com/codehasan/Dex2C/fork)
-[![Size](https://img.shields.io/github/repo-size/codehasan/Dex2C?color=green)](https://github.com/codehasan/Dex2C/)
-[![Contributors](https://img.shields.io/github/contributors/codehasan/Dex2C?color=green)](https://github.com/codehasan/Dex2C/graphs/contributors)
-[![License](https://img.shields.io/badge/License-Apache-blue)](./LICENSE)
+---
 
+## 功能特性
 
-  
-  <p align="center">
-    Method-based AOT compiler that can wrap Dalvik bytecode with JNI native code.
-  </p>
-</div>
+- **Dalvik → C 转换**：将指定的 Java/Dalvik 方法转换为 C 代码，通过 Android NDK 编译为原生库
+- **APK 自动处理**：自动反编译、修改、回编译、签名，无需手动干预
+- **OLLVM 混淆（可选）**：集成 OLLVM 控制流平坦化、虚假控制流、字符串加密等保护
+- **跨平台安装**：提供 Linux/macOS/WSL (`setup.sh`) 与 Windows (`setup.ps1`) 一键安装脚本
 
-<!-- TABLE OF CONTENTS -->
-<details>
-<summary>Table of contents</summary>
-  <ol>
-    <li>
-      <a href="#about-the-project">About the project</a>
-      <ul>
-        <li><a href="#built-with">Built with</a></li>
-      </ul>
-    </li>
-    <li>
-      <a href="#installation">Installation</a>
-      <ul>
-        <li><a href="#linux">Linux</a></li>
-        <li><a href="#windows">Windows</a></li>
-        <li><a href="#termux">Android (Termux)</a></li>
-      </ul>
-    </li>
-    <li>
-      <a href="#usage">Usage</a>
-        <ul>
-          <li><a href="#filters">Filters</a></li>
-          <li><a href="#protect-apps">Protect apps</a></li>
-        </ul>
-    </li>
-    <li><a href="#how-to-change-lib-name">How to change lib name</a></li>
-    <li><a href="#roadmap">Roadmap</a></li>
-    <li><a href="#contributing">Contributing</a></li>
-    <li><a href="#license">License</a></li>
-    <li><a href="#acknowledgments">Acknowledgments</a></li>
-  </ol>
-</details>
+---
 
+## 环境要求
 
-<!-- ABOUT THE PROJECT -->
-# About the project
+| 依赖 | 版本要求 | 说明 |
+|------|---------|------|
+| Python | ≥ 3.8 | 运行主程序 |
+| JDK | ≥ 17 | 编译与签名 |
+| Android NDK | r25c (OLLVM) / r27c (普通) | 编译 Native 代码 |
+| C++ 编译器 | GCC/Clang/MSVC | OLLVM 编译需要 |
 
-This project is inspired by [amimo/dcc](https://github.com/amimo/dcc), which aims to make it easy for everyone to use this tool. We automated plenty of processes that you had to do manually in the original DCC. Moreover, we always try to add new features to make this tool more usable in real-world applications.
-Check out <a href="#roadmap">Roadmap</a> to know about the changes we made and also the changes we are planning to make in the feature.
+---
 
-### Built with
+## 快速开始
 
-
-* ![Python][Python-Badge]
-* [![Androguard][Androguard-Badge]][Androguard_Repository]
-
-
-<!-- GETTING STARTED -->
-# Installation
-
-Python 3.8 or higher is required for running this tool. So, make sure your python is up-to-date.
-
-1. Clone the repo.
-   ```bash
-   git clone https://github.com/BaiLian3415/Dex2C-New.git
-   ```
-2. Open the cloned directory.
-   ```bash
-   cd dex2c
-   ```
-   
-3. <a href="https://developer.android.com/ndk/downloads">Download</a> android NDK for your OS and extract it. Copy the folder path where `ndk-build` executable is located inside the extracted folder and configure `ndk_dir` in `dcc.cfg`
-
-### Linux
-
-![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
-
-1. Install required dependencies.
-   ```bash
-   pip3 install -r requirements.txt
-   ```
-2. Install JRE/JDK & zipalign if you don't have it installed. The recommended JDK version is 17.
-   ```bash
-   sudo apt-get install openjdk-17-jdk zipalign
-   ```
-
-### Windows
-
-![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)
-
-> [!NOTE]
-> While this is supported on Windows, we strongly recommend using a Linux system for optimal compatibility and performance. If you're on Windows, consider using a Windows Subsystem for Linux (WSL) distribution to ensure a smoother and more reliable experience. The setup and instructions for WSL are the same as those for a [Linux](#linux).
-
-1. Install required dependencies.
-   ```bash
-   pip3 install -r requirements.txt
-   ```
-2. Install JRE/JDK from <a href="https://www.oracle.com/java/technologies/javase/jdk11-archive-downloads.html">oracle</a> if you don't have it installed. Search in Google, how to install JDK in Windows if you need more guidance on this topic. The recommended JDK version is 11 and up.
-3. Make sure you've `zipalign` installed. You'll get it in Android SDK build-tools from <a href="https://developer.android.com/studio/releases/build-tools">here</a>. Add it to your system path.
-
-### Termux
-
-![Android](https://img.shields.io/badge/Android-3DDC84?style=for-the-badge&logo=android&logoColor=white)
-
-One Step Installation: Run Below Command
-   ```bash
-   curl -L# -o termux_install.sh https://raw.githubusercontent.com/codehasan/dex2c/master/termux_install.sh && bash termux_install.sh
-   ```
-> NOTE: Some users have reported about installation errors with latest `clang` on termux. If you happen to face the same issue, then uncomment the lines stated in `termux_install.sh` and then proceed with the installation.
-
-
-<!-- USAGE EXAMPLES -->
-# Usage
-
-### Filters
-
-Add all your filters in `filter.txt` file - one rule for each line. Filters are made using regex patterns. There are two types of filters available in **Dex2c** - whitelist, and blacklist. You can use them whenever you need them.
-
-#### WhiteList
-
-- Protect just one method in a specific class.
-```
-com/some/class;some_method(some_parameters)return_type
-```
-
-- Protect all methods in a specific class.
-```
-com/some/class;.*
-```
-
-- Protect all methods in all classes under a package path.
-```
-com/some/package/.*;.*
-```
-
-- Protect a method with the name onCreate in all classes.
-```
-.*;onCreate\(.*
-```
-
-#### BlackList
-
-Adding an exclamation `!` sign before a rule will mark that rule as a blacklist.
-
-- Exclude one method in a specific class from being protected.
-```
-!com/some/class;some_method(some_parameters)return_type
-```
-
-- Exclude all methods in a specific class from being protected.
-```
-!com/some/class;.*
-```
-
-- Exclude all methods in all classes under a package path from being protected.
-```
-!com/some/package/.*;.*
-```
-
-- Exclude a method with the name onCreate in all classes from being protected.
-```
-!.*;onCreate\(.*
-```
-
-
-### Protect apps
-
-- Copy your apk file to `dex2c` folder where `dcc.py` is located and run this command.
+### 1. 克隆仓库
 
 ```bash
-python3 dcc.py -a input.apk -o output.apk
+git clone https://github.com/BaiLian3415/Dex2C-New.git
+cd Dex2C-New
 ```
 
-- Run this command to know about all the other options available in dcc to find the best ones for your needs.
+### 2. 运行安装脚本
+
+#### Linux / macOS / WSL
 
 ```bash
-python3 dcc.py --help
+chmod +x unix_setup.sh
+./unix_setup.sh
 ```
 
+按提示选择模式：
+- **模式 1（推荐）**：标准 NDK r27c，稳定可靠
+- **模式 2**：NDK r25c + OLLVM 编译集成（需要 4GB+ 内存，耗时较长）
 
-<!-- CHANGE LIB NAME -->
-# How to change lib name
+#### Windows (PowerShell)
 
-Open `project/jni/Android.mk` file in the cloned directory. You will find a variable named `LOCAL_MODULE`, initially with the value `stub`. Please change it to your desired lib name. Keep in mind the following instructions to prevent possible errors.
-- Don't use spaces in lib name, use hyphen `-` or underscore `_`
-- Don't use any kind of symbols or punctuations in lib name other than underscores and hyphens
-- Don't start the lib name with the text `lib` itself
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+.\windows_setup.ps1
+```
 
+> Windows OLLVM 模式需预先安装 **Visual Studio 2019/2022** 的「使用 C++ 的桌面开发」工作负载。
 
+### 3. 激活虚拟环境
 
-<!-- ROADMAP -->
-# Roadmap
+```bash
+# Linux / macOS / WSL
+source .venv/bin/activate
 
-- [x] Add custom lib loader
-- [x] Add new apksigner
-- [x] Add multi-dex support
-- [x] Add app abi handler
-- [x] Add signature configuration in `dcc.cfg`
-- [x] Add new options
-    - [x] --skip-synthetic
-    - [x] --custom-loader
-    - [x] --force-keep-libs
-    - [x] --obfuscate
-    - [x] --dynamic-register
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+```
 
-See the [open issues](https://github.com/codehasan/dex2c/issues) for a full list of proposed features and known issues.
+### 4. 配置过滤规则
 
+编辑 `filter.txt`，指定需要转换/保护的方法：
 
+```text
+# 白名单：保护 com.example 包下的所有方法
+com/example/.*;.*
 
-<!-- CONTRIBUTING -->
-# Contributing
+# 黑名单：排除特定方法（行首加 !）
+!com/example/MainActivity;onCreate(.*)V
+```
 
-Contributions are what makes the open-source community such an amazing place to learn, inspire, and create. Any contributions you make are **greatly appreciated**.
+### 5. 运行 Dex2C
 
-If you have a suggestion that would make this better, please fork the repo and create a pull request. You can also simply open an issue with the tag "enhancement".
-Don't forget to give this project a star! Thanks again!
+```bash
+python dcc.py -a input.apk -o output.apk
+```
 
-1. Fork the project
-2. Create your feature branch. (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes. (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch. (`git push origin feature/AmazingFeature`)
-5. Open a pull request.
+---
 
+## 目录结构
 
+```
+Dex2C-New/
+├── dcc.py              # 主程序
+├── dcc.cfg             # 配置文件（脚本自动更新）
+├── requirements.txt    # Python 依赖
+├── filter.txt          # 方法过滤规则
+├── setup.sh            # Linux/macOS/WSL 安装脚本
+├── setup.ps1           # Windows PowerShell 安装脚本
+├── tools/
+│   ├── apktool.jar     # 已包含
+│   ├── apksigner.jar   # 已包含
+│   └── manifest-editor.jar
+└── project/            # NDK 编译项目模板
+    └── jni/
+        └── Android.mk
+```
 
-<!-- LICENSE -->
-# License
+---
 
-Distributed under the Apache License. See `LICENSE.txt` for more information.
+## OLLVM 混淆说明
 
+选择模式 2 后，脚本自动完成：
 
+1. 克隆并编译 OLLVM (heroims/obfuscator, `llvm-13.x`)
+2. 替换 NDK 中的 `clang`/`clang++`
+3. 在 `dcc.cfg` 中启用 `ollvm.enable`
 
-<!-- ACKNOWLEDGMENTS -->
-# Acknowledgments
+**默认混淆参数：**
 
-### Projects
+```json
+{
+    "enable": true,
+    "flags": "-fvisibility=hidden -mllvm -fla -mllvm -split -mllvm -split_num=5 -mllvm -sub -mllvm -sub_loop=5 -mllvm -sobf -mllvm -bcf_loop=5 -mllvm -bcf_prob=100"
+}
+```
 
-* [DCC](https://github.com/amimo/dcc)
-* [Androguard](https://github.com/androguard/androguard)
+修改 `dcc.cfg` 中的 `ollvm.flags` 即可调整。
 
-### People
+---
 
-* Rahat - [Telegram](https://t.me/botxrahat)
-* GoldenBoot - [Telegram](https://t.me/goldenboot)
+## 常见问题
 
-<p align="right"><a href="#readme-top">Go to top</a></p>
+### Q: OLLVM 编译时提示内存不足 / Killed
+A: OLLVM 单文件编译峰值约 1.5-2GB。建议：
+- 增加系统内存至 4GB 以上
+- 增加 Swap：`sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`
+- 脚本会自动检测可用内存并限制线程数（低内存强制单线程）
 
-<!-- MARKDOWN LINKS & IMAGES -->
-[Python-Badge]: https://img.shields.io/badge/Python-F6D049?style=for-the-badge&logo=python
-[Androguard-Badge]: https://img.shields.io/badge/Androguard-FFFFFF?style=for-the-badge&logo=android
-[Androguard_Repository]: https://github.com/androguard/androguard
+### Q: ndk-build 报错找不到 `libunwind.a`
+A: OLLVM 报告版本 13.0.1，但 NDK r25c 的库在 `lib64/clang/14.0.7/`。脚本已自动创建符号链接 `lib/clang/13.0.1 -> lib64/clang/14.0.7`。若手动安装，请自行创建该链接。
+
+### Q: zipalign 报错缺少 `libc++.so`
+A: 脚本会自动创建 `libc++.so -> libc++.so.1` 符号链接。若失败，手动执行：
+```bash
+sudo ln -s /usr/lib/x86_64-linux-gnu/libc++.so.1 /usr/lib/x86_64-linux-gnu/libc++.so
+```
+
+---
+
+## 许可证
+
+本项目遵循开源许可证发布。请遵守相关协议使用。
+
+---
+
+## 致谢
+
+再次感谢 [amimo](https://github.com/amimo/dcc) 提供 Dex2C 原始实现，以及所有上游开源项目的贡献者。
