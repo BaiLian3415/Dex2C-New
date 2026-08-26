@@ -30,14 +30,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-# 检查 sudo 权限（在需要时）
+# 检查 sudo 权限
 check_sudo() {
     if [[ "$EUID" -eq 0 ]]; then return 0; fi
     if sudo -n true 2>/dev/null; then return 0; fi
     print_error "需要 sudo 权限以安装系统依赖。请确保当前用户具有 sudo 权限，或先执行 'sudo -v' 缓存凭据。"
 }
 
-# 检查 sudo 凭据是否缓存（非阻塞）
 check_sudo_cached() {
     if [[ "$EUID" -eq 0 ]]; then return 0; fi
     sudo -n true 2>/dev/null
@@ -51,7 +50,6 @@ abs_path() {
     if [[ "$1" = /* ]]; then echo "$1"; else echo "$(pwd)/$1"; fi
 }
 
-# 动态检测 Host 架构
 get_host_arch() {
     local arch; arch=$(uname -m)
     case "$arch" in
@@ -64,7 +62,7 @@ get_host_arch() {
 HOST_ARCH=$(get_host_arch)
 
 # =============================================================================
-# 【v3 修复】统一下载函数 —— 带超时/重试，使用 dot 进度避免终端异常
+# 统一下载函数
 # =============================================================================
 download_file() {
     local url="$1" output="$2" desc="${3:-文件}" timeout="${4:-120}" retries="${5:-3}"
@@ -82,7 +80,6 @@ download_file() {
         fi
 
         if check_command wget; then
-            # 【v3 修复】使用 dot:giga 进度，避免 bar:noscroll 在某些终端异常
             if wget --timeout="$timeout" --tries=1 --progress=dot:giga \
                     -O "$output" "$url" 2>&1 | tail -n 10; then
                 success=true; break
@@ -107,33 +104,25 @@ download_file() {
         print_error "下载 $desc 后文件为空或不存在，可能下载被中断。"
     fi
 
-    local fsize
-    fsize=$(du -h "$output" 2>/dev/null | cut -f1)
+    local fsize; fsize=$(du -h "$output" 2>/dev/null | cut -f1)
     print_success "$desc 下载完成 ($fsize)"
 }
 
 # =============================================================================
-# 【v3 新增】安全解压函数 —— 带强制覆盖 + Python fallback，防止 unzip 卡死
+# 【v4 修复】安全解压函数 —— unzip -o + Python zipfile fallback
 # =============================================================================
 safe_unzip_extract() {
-    local zipfile="$1"
-    local pattern="$2"
-    local destdir="$3"
+    local zipfile="$1" pattern="$2" destdir="$3"
 
     print_info "解压: $pattern 从 $zipfile 到 $destdir"
-
-    # 确保目标目录存在
     mkdir -p "$destdir"
 
-    # 先删除已存在的目标文件，避免 unzip 交互式覆盖提示卡死
-    local basename
-    basename=$(basename "$pattern")
+    local basename; basename=$(basename "$pattern")
     if [[ -f "$destdir/$basename" ]]; then
         print_info "  删除已存在的 $destdir/$basename"
         rm -f "$destdir/$basename"
     fi
 
-    # 方法 1: unzip -o 强制覆盖
     if check_command unzip; then
         print_info "  使用 unzip 提取..."
         if unzip -o -q -j "$zipfile" "$pattern" -d "$destdir" 2>/dev/null; then
@@ -144,7 +133,6 @@ safe_unzip_extract() {
         fi
     fi
 
-    # 方法 2: Python zipfile 模块（跨平台，无交互式提示问题）
     if check_command python3; then
         print_info "  使用 Python zipfile 提取..."
         if python3 -c "
@@ -156,7 +144,6 @@ try:
     with zipfile.ZipFile(zip_path, 'r') as z:
         found = [n for n in z.namelist() if n.endswith(pattern) or n == pattern]
         if not found:
-            # 尝试直接匹配
             found = [n for n in z.namelist() if pattern in n]
         if not found:
             print(f'ERROR: 在 zip 中未找到匹配 {pattern} 的文件')
@@ -175,15 +162,6 @@ except Exception as e:
             return 0
         else
             print_warn "  Python zipfile 提取也失败了"
-        fi
-    fi
-
-    # 方法 3: 7z
-    if check_command 7z; then
-        print_info "  使用 7z 提取..."
-        if 7z e -o"$destdir" -y "$zipfile" "$pattern" 2>/dev/null; then
-            print_success "  7z 提取成功"
-            return 0
         fi
     fi
 
@@ -380,7 +358,7 @@ fix_zipalign_deps() {
     fi
 }
 
-# ==================== 安装 zipalign（v3 修复：防卡死） ====================
+# ==================== 安装 zipalign ====================
 install_zipalign() {
     if check_command zipalign; then
         print_success "zipalign 已在 PATH 中，跳过安装"
@@ -398,7 +376,6 @@ install_zipalign() {
 
     download_file "$URL" "$ZA_ZIP" "zipalign (Android Build Tools r33)" 120 3
 
-    # 【v3 修复】使用 safe_unzip_extract 替代裸 unzip，防卡死
     if safe_unzip_extract "$ZA_ZIP" "android-13/zipalign" "$ZA"; then
         rm -f "$ZA_ZIP"
     else
@@ -483,28 +460,52 @@ install_ndk() {
     echo "$DIR"
 }
 
-# ==================== 跨平台安全的文本替换 ====================
+# =============================================================================
+# 【v4 修复】跨平台安全的文本替换 —— \n 正确转义为真实换行符
+# =============================================================================
 safe_patch_file() {
     local file="$1" pattern="$2" replacement="$3"
-    if [[ ! -f "$file" ]]; then print_warn "补丁目标文件不存在: $file"; return 1; fi
+
+    if [[ ! -f "$file" ]]; then
+        print_warn "补丁目标文件不存在: $file"
+        return 1
+    fi
+
+    # 使用 Python 进行跨平台安全的文本替换
+    # 【v4 关键修复】将 replacement 中的 \\n 替换为真实的换行符
     python3 << EOF
 import sys
+
 with open(r"$file", 'r', encoding='utf-8', errors='ignore') as f:
     content = f.read()
-if r"$pattern" not in content: sys.exit(0)
-if r"$replacement" in content: sys.exit(0)
-content = content.replace(r"$pattern", r"$replacement")
+
+if r"$pattern" not in content:
+    print("[INFO] 补丁目标文本不存在，跳过", file=sys.stderr)
+    sys.exit(0)
+
+# 将 Bash 传入的 \\n 替换为真实的换行符
+replacement = r"$replacement".replace('\\n', '\n')
+
+if replacement in content:
+    print("[INFO] 补丁已存在，跳过", file=sys.stderr)
+    sys.exit(0)
+
+content = content.replace(r"$pattern", replacement)
+
 with open(r"$file", 'w', encoding='utf-8') as f:
     f.write(content)
+
+print("[SUCCESS] 补丁已应用", file=sys.stderr)
 EOF
 }
 
-# ==================== OLLVM 补丁 ====================
+# ==================== 修复 OLLVM GCC 13+ 兼容性补丁 ====================
 apply_ollvm_patches() {
     local WORK_DIR="$1"
     local SIGNALS_H="$WORK_DIR/llvm/include/llvm/Support/Signals.h"
     if [[ -f "$SIGNALS_H" ]] && ! grep -q '#include <cstdint>' "$SIGNALS_H"; then
         print_info "应用 OLLVM GCC 13+ 兼容性补丁..."
+        # 【v4 修复】\\n 会被 safe_patch_file 正确转义为换行符
         safe_patch_file "$SIGNALS_H" "#include <string>" "#include <string>\n#include <cstdint>"
         print_success "补丁已应用"
     fi
@@ -614,7 +615,7 @@ install_ollvm() {
         print_info "开始编译 OLLVM，请耐心等待（首次编译耗时较长）..."
         if ! make -j"$JOBS"; then
             cd "$ORIGINAL_DIR"
-            print_error "OLLVM 编译失败\n\n诊断：很可能是内存不足（OOM）导致。\n建议：\n  1. 关闭其他程序释放内存\n  2. 增加 WSL 内存限制（.wslconfig 中 memory=8GB 或更高）\n  3. 增加 Swap 空间：sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile\n  4. 或选择普通模式（不安装 OLLVM）"
+            print_error "OLLVM 编译失败\n\n诊断：很可能是内存不足（OOM）导致。\n建议：\n  1. 关闭其他程序释放内存\n  2. 增加 WSL 内存限制（.wslconfig 中 memory=8GB 或更高）\n  3. 增加 Swap 空间：sudo swapoff /swapfile 2>/dev/null; sudo rm -f /swapfile; sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile\n  4. 或选择普通模式（不安装 OLLVM）"
         fi
 
         print_info "安装 OLLVM..."
