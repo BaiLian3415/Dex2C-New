@@ -93,25 +93,6 @@ python dcc.py -a input.apk -o output.apk
 
 ---
 
-## 目录结构
-
-```
-Dex2C-New/
-├── dcc.py              # 主程序
-├── dcc.cfg             # 配置文件（脚本自动更新）
-├── requirements.txt    # Python 依赖
-├── filter.txt          # 方法过滤规则
-├── setup.sh            # Linux/macOS/WSL 安装脚本
-├── setup.ps1           # Windows PowerShell 安装脚本
-├── tools/
-│   ├── apktool.jar     # 已包含
-│   ├── apksigner.jar   # 已包含
-│   └── manifest-editor.jar
-└── project/            # NDK 编译项目模板
-    └── jni/
-        └── Android.mk
-```
-
 ---
 
 ## OLLVM 混淆说明
