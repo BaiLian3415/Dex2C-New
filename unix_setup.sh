@@ -786,24 +786,4 @@ fi
 
 # ---------------------------------------------------------------- 收尾报告
 step "全部完成 ✔"
-cat <<FINAL
-${C_G}■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
-  部署摘要
-■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■${C_N}
-  • Python 依赖 ........ networkx pydot future pyasn1 cryptography lxml asn1crypto
-  • 目标 NDK ........... ${NDK_DIR:-见上文}
-  • 官方兜底版本 ....... $NDK_REL（仅在未检测到任何 NDK 时才下载）
-  • OLLVM 获取方式 ..... $MODE     来源: ${SRC_BIN:-}
-  • 内部目录标签 ....... ${TARGET_TAG:-<termux分支下自动探测>}
-  • 混淆开关 ........... dcc.cfg → ollvm.enable = true
-  • 下一步加固 ......... python3 dcc.py 你的应用.apk
-                          （启动时应看到: You've enabled ollvm flag ... 警告即代表生效）
-  • 回滚工具链 ......... 用 NDK 内 bin/clang.orig 覆盖回 bin/clang
-  • 清理编译缓存 ....... rm -rf $WORK_DIR  （source 模式约占 35~60GB）
-
-${C_Y}提示:${C_N} 需要调整混淆强度时编辑 dcc.cfg 的 ollvm.flags：
-      默认组合(-fla/-split=5/-sub=5/-sobf/-bcf_prob=100)属于激进档；
-      初次适配建议先降为 -mllvm -bcf_prob=40 -mllvm -sub_loop=2 试编译全量 ABI，
-      确认无误后再逐步调高。四个 ABI 全开时内存与耗时翻四倍，按需裁剪 APP_ABI。
-FINAL
 info "祝加固顺利!"
