@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  setup_dex2c_ollvm.sh —— Dex2C-New 一键环境部署脚本（依赖安装 + OLLVM 混淆工具链）
+#  unix_setup.sh —— Dex2C-New 一键环境部署脚本（依赖安装 + OLLVM 混淆工具链）
 #
 #  适用平台 : Ubuntu / Debian / Fedora / Arch / Rocky(x86_64)、Termux(aarch64)
 #  放置位置 : 请放在 Dex2C-New 仓库根目录下（与 dcc.py / dcc.cfg 同级）
@@ -24,13 +24,13 @@
 #    [7] 更新 dcc.cfg      : 写入 ndk_dir 与 ollvm.enable=true（--no-cfg-edit 关闭）
 #
 #  常用示例 :
-#    bash setup_dex2c_ollvm.sh                          # 全自动部署(auto)
-#    bash setup_dex2c_ollvm.sh --dry-run                # 只打印计划动作，不落地
-#    bash setup_dex2c_ollvm.sh --mode=source            # 强制源码编译 OLLVM
-#    bash setup_dex2c_ollvm.sh --mode=prebuilt --ollvm-url=/x/ollvm.tar.gz
-#    bash setup_dex2c_ollvm.sh --ndk-dir=/opt/android-ndk-r25c
-#    bash setup_dex2c_ollvm.sh --skip-system-deps       # 跳过系统包管理器安装
-#    JOBS=8 bash setup_dex2c_ollvm.sh --mode=source     # 指定编译并行数
+#    bash unix_setup.sh                          # 全自动部署(auto)
+#    bash unix_setup.sh --dry-run                # 只打印计划动作，不落地
+#    bash unix_setup.sh --mode=source            # 强制源码编译 OLLVM
+#    bash unix_setup.sh --mode=prebuilt --ollvm-url=/x/ollvm.tar.gz
+#    bash unix_setup.sh --ndk-dir=/opt/android-ndk-r25c
+#    bash unix_setup.sh --skip-system-deps       # 跳过系统包管理器安装
+#    JOBS=8 bash unix_setup.sh --mode=source     # 指定编译并行数
 #
 #  回滚方式 : 还原 NDK 目录下的 bin/clang.orig → bin/clang 即可恢复原版工具链
 # ============================================================================
